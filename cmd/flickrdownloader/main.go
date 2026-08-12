@@ -10,10 +10,10 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/vietvu/flickrdownloader/pkg/api"
-	"github.com/vietvu/flickrdownloader/pkg/config"
-	"github.com/vietvu/flickrdownloader/pkg/download"
-	"github.com/vietvu/flickrdownloader/pkg/ui"
+	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/flickrdownloader/pkg/config"
+	"github.com/jooservices/flickrdownloader/pkg/download"
+	"github.com/jooservices/flickrdownloader/pkg/ui"
 	"golang.org/x/term"
 )
 

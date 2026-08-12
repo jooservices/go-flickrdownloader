@@ -39,7 +39,7 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 Build from source:
 
 ```bash
-git clone https://github.com/vietvu/flickrdownloader.git
+git clone https://github.com/jooservices/flickrdownloader.git
 cd flickrdownloader
 go build -o flickrdownloader ./cmd/flickrdownloader
 ```
@@ -47,7 +47,7 @@ go build -o flickrdownloader ./cmd/flickrdownloader
 Or install directly with Go:
 
 ```bash
-go install github.com/vietvu/flickrdownloader/cmd/flickrdownloader@latest
+go install github.com/jooservices/flickrdownloader/cmd/flickrdownloader@latest
 ```
 
 ## Quick start

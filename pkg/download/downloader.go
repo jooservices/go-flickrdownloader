@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vietvu/flickrdownloader/pkg/api"
-	"github.com/vietvu/flickrdownloader/pkg/ui"
+	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/flickrdownloader/pkg/ui"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )

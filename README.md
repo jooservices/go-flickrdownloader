@@ -31,12 +31,24 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 
 ## Requirements
 
-- Go 1.25 or newer (only needed to build from source)
 - A free Flickr API key: https://www.flickr.com/services/apps/create/apply/
+- Go 1.25+ only if you're building from source (not needed for the prebuilt binaries below)
 
 ## Install
 
-Build from source:
+### Prebuilt binary (recommended)
+
+Download the archive for your platform from the [Releases page](https://github.com/jooservices/flickrdownloader/releases/latest), extract it, and put the `flickrdownloader` binary somewhere on your `PATH`.
+
+```bash
+# Example: macOS (Apple Silicon)
+tar -xzf flickrdownloader_v1.0.0_darwin_arm64.tar.gz
+sudo mv flickrdownloader /usr/local/bin/
+```
+
+Binaries are provided for macOS (amd64/arm64), Linux (amd64/arm64), and Windows (amd64).
+
+### Build from source
 
 ```bash
 git clone https://github.com/jooservices/flickrdownloader.git

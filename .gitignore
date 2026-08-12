@@ -1,0 +1,15 @@
+# Build artifacts
+/flickrdownloader
+
+# Downloaded content
+/photos/
+
+# macOS
+.DS_Store
+
+# Local Claude Code settings (per-developer, not shared)
+.claude/settings.local.json
+
+# Go
+*.test
+*.out

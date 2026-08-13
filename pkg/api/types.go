@@ -47,6 +47,8 @@ type Photo struct {
 	OriginalFormat string  `json:"originalformat"`
 	URLOriginal    string  `json:"url_o"`
 	Media          string  `json:"media"`
+	OWidth         FlexInt `json:"o_width"`
+	OHeight        FlexInt `json:"o_height"`
 }
 
 type PhotosResponse struct {

@@ -20,6 +20,7 @@ const (
 
 	IconOk    = "✓"
 	IconSkip  = "○"
+	IconLink  = "⇄"
 	IconErr   = "✗"
 	IconPhoto = "📷"
 	IconClock = "⏱"
@@ -41,6 +42,7 @@ type Stats struct {
 	Total    int64
 	Success  int64
 	Skipped  int64
+	Linked   int64
 	Failed   int64
 	Bytes    int64
 	Failures []FailEntry
@@ -61,6 +63,7 @@ func NewProgress(total int) *Progress {
 
 func (p *Progress) AddSuccess()      { atomic.AddInt64(&p.stats.Success, 1) }
 func (p *Progress) AddSkipped()      { atomic.AddInt64(&p.stats.Skipped, 1) }
+func (p *Progress) AddLinked()       { atomic.AddInt64(&p.stats.Linked, 1) }
 func (p *Progress) AddBytes(n int64) { atomic.AddInt64(&p.stats.Bytes, n) }
 
 func (p *Progress) AddFailure(id, url, errMsg string) {
@@ -73,7 +76,7 @@ func (p *Progress) AddFailure(id, url, errMsg string) {
 func (p *Progress) Stats() *Stats { return p.stats }
 
 func (p *Progress) completed() int64 {
-	return p.stats.Success + p.stats.Skipped + p.stats.Failed
+	return p.stats.Success + p.stats.Skipped + p.stats.Linked + p.stats.Failed
 }
 
 func (p *Progress) elapsed() time.Duration { return time.Since(p.start) }
@@ -177,6 +180,10 @@ func (p *Progress) Summary() string {
 	skip := ColorYellow + fmt.Sprintf("%s %d", IconSkip, p.stats.Skipped) + ColorReset
 	fail := ColorRed + fmt.Sprintf("%s %d", IconErr, p.stats.Failed) + ColorReset
 	b.WriteString(fmt.Sprintf("  %s  %s  %s", ok, skip, fail))
+	if p.stats.Linked > 0 {
+		b.WriteString(fmt.Sprintf("  %s%s %d linked%s",
+			ColorCyan, IconLink, p.stats.Linked, ColorReset))
+	}
 
 	if p.stats.Bytes > 0 {
 		b.WriteString(fmt.Sprintf("  %s%s %s%s",
@@ -236,3 +243,6 @@ func formatBytes(n int64) string {
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
+
+// FormatBytes renders a byte count in a human-friendly form.
+func FormatBytes(n int64) string { return formatBytes(n) }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,7 @@ type Stats struct {
 	Total   int64
 	Success int64
 	Skipped int64
+	Linked  int64
 	Failed  int64
 }
 
@@ -33,6 +35,12 @@ type Downloader struct {
 	currPage   int64
 	totalPages int64
 	dlLimiter  *rate.Limiter
+
+	// downloadedPaths records, per photo ID, the path of the first copy
+	// written to disk. Later albums reuse it via hardlinks instead of
+	// re-downloading the same file (feature: cross-album dedupe).
+	downloadedPaths map[string]string
+	pathMu          sync.Mutex
 }
 
 var safeNameRe = regexp.MustCompile(`[<>:"/\\|?*]`)
@@ -60,10 +68,11 @@ func New(client *api.Client, outDir string, numWorkers int) *Downloader {
 	// otherwise a larger worker pool just means more goroutines blocked on
 	// the same handful of tokens per second.
 	return &Downloader{
-		Client:     client,
-		OutDir:     outDir,
-		NumWorkers: numWorkers,
-		dlLimiter:  rate.NewLimiter(rate.Limit(numWorkers*2), numWorkers),
+		Client:          client,
+		OutDir:          outDir,
+		NumWorkers:      numWorkers,
+		dlLimiter:       rate.NewLimiter(rate.Limit(numWorkers*2), numWorkers),
+		downloadedPaths: make(map[string]string),
 	}
 }
 
@@ -155,6 +164,23 @@ func cleanExt(ext string) string {
 	}
 }
 
+// httpHint turns an HTTP status into actionable advice.
+func httpHint(status int) string {
+	switch status {
+	case http.StatusForbidden:
+		return "Flickr denied access — the photo may be private, or the owner disabled original downloads"
+	case http.StatusNotFound:
+		return "the photo no longer exists on Flickr"
+	case http.StatusUnauthorized:
+		return "authentication required — check that your account can view this photo"
+	case http.StatusTooManyRequests:
+		return "Flickr is rate-limiting downloads — retry later or lower -w"
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable:
+		return "Flickr's servers had a problem — retrying usually helps"
+	}
+	return ""
+}
+
 func (d *Downloader) downloadFile(ctx context.Context, url, filePath string) (int64, error) {
 	if err := d.dlLimiter.Wait(ctx); err != nil {
 		return 0, fmt.Errorf("rate limiter: %w", err)
@@ -179,19 +205,25 @@ func (d *Downloader) downloadFile(ctx context.Context, url, filePath string) (in
 
 		resp, err := downloadHTTPClient.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("http get: %w", err)
+			lastErr = fmt.Errorf("http get: %w — hint: check your connection", err)
 			continue
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
 			lastErr = fmt.Errorf("http status %d", resp.StatusCode)
+			fmt.Fprintf(os.Stderr, "\r\033[K  %s%s %s — backing off and retrying...%s\n",
+				ui.ColorYellow, ui.IconClock, httpHint(resp.StatusCode), ui.ColorReset)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			h := httpHint(resp.StatusCode)
+			if h != "" {
+				return 0, fmt.Errorf("http status %d — hint: %s", resp.StatusCode, h)
+			}
 			return 0, fmt.Errorf("http status %d", resp.StatusCode)
 		}
 
@@ -240,6 +272,21 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 		return
 	}
 
+	// Cross-album dedupe: if this photo was already downloaded for another
+	// album, reuse it via a hardlink instead of downloading it again. On
+	// filesystems without hardlink support (e.g. some network mounts) we
+	// fall back to a regular download.
+	d.pathMu.Lock()
+	existing, ok := d.downloadedPaths[photo.ID]
+	d.pathMu.Unlock()
+	if ok {
+		target := filepath.Join(d.OutDir, photo.ID+filepath.Ext(existing))
+		if err := os.Link(existing, target); err == nil {
+			d.progress.AddLinked()
+			return
+		}
+	}
+
 	downloadURL, ext, err := d.resolveDownloadURL(ctx, photo)
 	if err != nil {
 		d.progress.AddFailure(photo.ID, "", err.Error())
@@ -253,6 +300,10 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 		d.progress.AddFailure(photo.ID, downloadURL, err.Error())
 		return
 	}
+
+	d.pathMu.Lock()
+	d.downloadedPaths[photo.ID] = filePath
+	d.pathMu.Unlock()
 
 	d.progress.AddSuccess()
 	d.progress.AddBytes(n)
@@ -352,21 +403,36 @@ func (d *Downloader) downloadPhotosFromPages(
 		Total:   int64(totalPhotos),
 		Success: d.progress.Stats().Success,
 		Skipped: d.progress.Stats().Skipped,
+		Linked:  d.progress.Stats().Linked,
 		Failed:  d.progress.Stats().Failed,
 	}
 }
 
-func (d *Downloader) DownloadByUser(ctx context.Context, userID string) (Stats, error) {
+// UserDownloadOptions controls DownloadByUser. A nil Sets slice fetches all
+// albums from the API (legacy behavior); an empty non-nil slice downloads no
+// albums. FirstPage may be supplied to avoid a duplicate API call (e.g. when
+// the caller already scanned the photostream for a dry-run plan).
+type UserDownloadOptions struct {
+	Sets           []api.PhotoSetInfo
+	FirstPage      *api.PhotosResponse
+	IncludeOrphans bool
+}
+
+func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts UserDownloadOptions) (Stats, error) {
 	userDir := filepath.Join(d.OutDir, userID)
 
-	fmt.Printf("  %sDiscovering photosets...%s\n", ui.ColorDim, ui.ColorReset)
-	sets, err := d.Client.GetPhotosets(ctx, userID)
-	if err != nil {
-		return Stats{}, fmt.Errorf("list photosets: %w", err)
+	sets := opts.Sets
+	if sets == nil {
+		fmt.Printf("  %sDiscovering photosets...%s\n", ui.ColorDim, ui.ColorReset)
+		fetched, err := d.Client.GetPhotosets(ctx, userID)
+		if err != nil {
+			return Stats{}, fmt.Errorf("list photosets: %w", err)
+		}
+		sets = fetched
 	}
 
 	downloaded := make(map[string]bool)
-	var totalSuccess, totalSkipped, totalFailed int64
+	var totalSuccess, totalSkipped, totalLinked, totalFailed int64
 
 	if len(sets) > 0 {
 		fmt.Printf("  %sFound %d photoset(s)%s\n", ui.ColorCyan, len(sets), ui.ColorReset)
@@ -416,41 +482,50 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string) (Stats, 
 
 		totalSuccess += stats.Success
 		totalSkipped += stats.Skipped
+		totalLinked += stats.Linked
 		totalFailed += stats.Failed
 	}
 
 	// Download remaining photos not in any photoset
-	firstPage, err := d.Client.GetPhotosByUser(ctx, userID, 1)
-	if err != nil {
-		return Stats{}, fmt.Errorf("get first page: %w", err)
+	firstPage := opts.FirstPage
+	if firstPage == nil {
+		fp, err := d.Client.GetPhotosByUser(ctx, userID, 1)
+		if err != nil {
+			return Stats{}, fmt.Errorf("get first page: %w", err)
+		}
+		firstPage = fp
 	}
+
+	includeOrphans := opts.IncludeOrphans || opts.Sets == nil
 
 	orphans := 0
 	var orphanPhotos []api.Photo
 
-	if firstPage.Photos.Total == 0 && len(sets) == 0 {
-		fmt.Printf("\n  %s%s No photos or photosets found for this user. Check that the NSID is correct.%s\n",
-			ui.ColorYellow, ui.IconErr, ui.ColorReset)
-		fmt.Printf("  %sNSID used: %s%s\n\n", ui.ColorDim, userID, ui.ColorReset)
-		fmt.Printf("  %sThis may mean:%s\n", ui.ColorBold, ui.ColorReset)
-		fmt.Printf("    %s- The user's content is private (OAuth is for a different user)%s\n", ui.ColorDim, ui.ColorReset)
-		fmt.Printf("    %s- The NSID resolved incorrectly%s\n", ui.ColorDim, ui.ColorReset)
-	}
-	for page := 1; page <= int(firstPage.Photos.Pages); page++ {
-		if page > 1 {
-			resp, err := d.Client.GetPhotosByUser(ctx, userID, page)
-			if err != nil {
-				continue
-			}
-			for _, p := range resp.Photos.Photo {
-				if !downloaded[p.ID] {
-					orphanPhotos = append(orphanPhotos, p)
+	if includeOrphans {
+		if firstPage.Photos.Total == 0 && len(sets) == 0 {
+			fmt.Printf("\n  %s%s No photos or photosets found for this user. Check that the NSID is correct.%s\n",
+				ui.ColorYellow, ui.IconErr, ui.ColorReset)
+			fmt.Printf("  %sNSID used: %s%s\n\n", ui.ColorDim, userID, ui.ColorReset)
+			fmt.Printf("  %sThis may mean:%s\n", ui.ColorBold, ui.ColorReset)
+			fmt.Printf("    %s- The user's content is private (OAuth is for a different user)%s\n", ui.ColorDim, ui.ColorReset)
+			fmt.Printf("    %s- The NSID resolved incorrectly%s\n", ui.ColorDim, ui.ColorReset)
+		}
+		for page := 1; page <= int(firstPage.Photos.Pages); page++ {
+			if page > 1 {
+				resp, err := d.Client.GetPhotosByUser(ctx, userID, page)
+				if err != nil {
+					continue
 				}
-			}
-		} else {
-			for _, p := range firstPage.Photos.Photo {
-				if !downloaded[p.ID] {
-					orphanPhotos = append(orphanPhotos, p)
+				for _, p := range resp.Photos.Photo {
+					if !downloaded[p.ID] {
+						orphanPhotos = append(orphanPhotos, p)
+					}
+				}
+			} else {
+				for _, p := range firstPage.Photos.Photo {
+					if !downloaded[p.ID] {
+						orphanPhotos = append(orphanPhotos, p)
+					}
 				}
 			}
 		}
@@ -474,6 +549,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string) (Stats, 
 
 		totalSuccess += stats.Success
 		totalSkipped += stats.Skipped
+		totalLinked += stats.Linked
 		totalFailed += stats.Failed
 	}
 
@@ -484,6 +560,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string) (Stats, 
 		Total:   int64(int(firstPage.Photos.Total)),
 		Success: totalSuccess,
 		Skipped: totalSkipped,
+		Linked:  totalLinked,
 		Failed:  totalFailed,
 	}, nil
 }

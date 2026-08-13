@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -44,6 +45,38 @@ func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
 	}
 }
 
+// flickrHint maps known Flickr error codes to actionable advice.
+func flickrHint(code int, msg string) string {
+	switch code {
+	case 1:
+		return "check the URL — the user, album or photo may not exist anymore"
+	case 96, 97:
+		return "your OAuth token has expired — run 'flickrdownloader auth' again"
+	case 98, 99:
+		return "authentication problem — run 'flickrdownloader auth' again"
+	case 100:
+		return "invalid API key — run 'flickrdownloader auth' again"
+	case 108, 111, 114:
+		return "the API call was refused (bad parameter?) — check the URL and retry"
+	case 112:
+		return "this API method isn't available for your key — try updating flickrdownloader"
+	case 429:
+		return "Flickr rate limit reached — wait a minute and retry"
+	}
+	if strings.Contains(strings.ToLower(msg), "rate") ||
+		strings.Contains(strings.ToLower(msg), "limit") {
+		return "Flickr rate limit reached — wait a minute and retry"
+	}
+	return ""
+}
+
+func flickrErr(code int, msg string) error {
+	if h := flickrHint(code, msg); h != "" {
+		return fmt.Errorf("flickr error [%d]: %s — hint: %s", code, msg, h)
+	}
+	return fmt.Errorf("flickr error [%d]: %s", code, msg)
+}
+
 func (c *Client) apiGet(ctx context.Context, method string, params map[string]string) ([]byte, error) {
 	if err := c.rateLimiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("rate limiter: %w", err)
@@ -66,7 +99,7 @@ func (c *Client) GetPhotosByUser(ctx context.Context, userID string, page int) (
 		"user_id":  userID,
 		"page":     fmt.Sprintf("%d", page),
 		"per_page": fmt.Sprintf("%d", photosPerPage),
-		"extras":   "original_format,url_o,media",
+		"extras":   "original_format,url_o,media,o_dims",
 	}
 
 	data, err := c.apiGet(ctx, "flickr.people.getPhotos", params)
@@ -80,7 +113,7 @@ func (c *Client) GetPhotosByUser(ctx context.Context, userID string, page int) (
 	}
 
 	if resp.Stat != "ok" {
-		return nil, fmt.Errorf("flickr error [%d]: %s", resp.Code, resp.Message)
+		return nil, flickrErr(resp.Code, resp.Message)
 	}
 
 	return &resp, nil
@@ -91,7 +124,7 @@ func (c *Client) GetPhotosByPhotoset(ctx context.Context, photosetID string, pag
 		"photoset_id": photosetID,
 		"page":        fmt.Sprintf("%d", page),
 		"per_page":    fmt.Sprintf("%d", photosPerPage),
-		"extras":      "original_format,url_o,media",
+		"extras":      "original_format,url_o,media,o_dims",
 	}
 
 	data, err := c.apiGet(ctx, "flickr.photosets.getPhotos", params)
@@ -105,7 +138,7 @@ func (c *Client) GetPhotosByPhotoset(ctx context.Context, photosetID string, pag
 	}
 
 	if resp.Stat != "ok" {
-		return nil, fmt.Errorf("flickr error [%d]: %s", resp.Code, resp.Message)
+		return nil, flickrErr(resp.Code, resp.Message)
 	}
 
 	return &resp, nil
@@ -127,7 +160,7 @@ func (c *Client) GetSizes(ctx context.Context, photoID string) (*SizesResponse, 
 	}
 
 	if resp.Stat != "ok" {
-		return nil, fmt.Errorf("flickr error [%d]: %s", resp.Code, resp.Message)
+		return nil, flickrErr(resp.Code, resp.Message)
 	}
 
 	return &resp, nil
@@ -151,7 +184,7 @@ func (c *Client) GetPhotosets(ctx context.Context, userID string) ([]PhotoSetInf
 			return nil, fmt.Errorf("unmarshal photosets list (page %d): %w — raw: %s", page, err, string(data))
 		}
 		if resp.Stat != "ok" {
-			return nil, fmt.Errorf("flickr error [%d]: %s — raw: %s", resp.Code, resp.Message, string(data))
+			return nil, fmt.Errorf("%w — raw: %s", flickrErr(resp.Code, resp.Message), string(data))
 		}
 		all = append(all, resp.Photosets.Photoset...)
 		if page >= int(resp.Photosets.Pages) {
@@ -175,7 +208,7 @@ func (c *Client) GetPhotosetInfo(ctx context.Context, photosetID string) (*Photo
 		return nil, fmt.Errorf("unmarshal photoset info: %w", err)
 	}
 	if resp.Stat != "ok" {
-		return nil, fmt.Errorf("flickr error [%d]: %s", resp.Code, resp.Message)
+		return nil, flickrErr(resp.Code, resp.Message)
 	}
 	return &resp.Photoset, nil
 }
@@ -193,7 +226,7 @@ func (c *Client) LookupUser(ctx context.Context, flickrURL string) (string, erro
 		return "", fmt.Errorf("unmarshal user: %w — raw: %s", err, string(data))
 	}
 	if resp.Stat != "ok" {
-		return "", fmt.Errorf("flickr error [%d]: %s — raw: %s", resp.Code, resp.Message, string(data))
+		return "", fmt.Errorf("%w — raw: %s", flickrErr(resp.Code, resp.Message), string(data))
 	}
 	return resp.User.ID, nil
 }
@@ -211,7 +244,7 @@ func (c *Client) GetPhotoInfo(ctx context.Context, photoID string) (*PhotoInfoRe
 		return nil, fmt.Errorf("unmarshal photo info: %w", err)
 	}
 	if resp.Stat != "ok" {
-		return nil, fmt.Errorf("flickr error [%d]: %s", resp.Code, resp.Message)
+		return nil, flickrErr(resp.Code, resp.Message)
 	}
 	return &resp, nil
 }

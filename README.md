@@ -22,12 +22,17 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 ## Features
 
 - Download an entire Flickr photostream, a single album, or a single photo/video from just its URL
+- Interactive album picker — when downloading a user in a terminal, select exactly which albums you want (arrow keys, space to toggle, `/` to filter)
 - Automatically discovers and mirrors a user's album structure on disk (photos not in any album land in an "uncategorized" folder)
+- `--dry-run` preview — album tree, photo counts and estimated total size before anything is downloaded
 - Concurrent downloads with a configurable worker pool
 - Resumable — already-downloaded files are skipped on re-run, regardless of file extension
+- Cross-album dedupe — a photo present in several albums is downloaded once and hardlinked into the others
 - Respects Flickr's API rate limits automatically
 - Handles both photos and videos, always fetching the original quality available
 - Live progress bar with ETA and transfer speed
+- Actionable error messages — Flickr error codes come with hints telling you what to do
+- Self-update via `flickrdownloader update` and shell completions for bash/zsh/fish/powershell
 
 ## Requirements
 
@@ -103,9 +108,48 @@ flickrdownloader download -u https://www.flickr.com/photos/someuser/52968474408
 | `--url` | `-u` | *(required)* | Flickr URL — user profile, album, or single photo |
 | `--out` | `-o` | `./photos` | Output directory |
 | `--workers` | `-w` | `20` | Number of concurrent download workers |
+| `--dry-run` | | `false` | Preview album tree, counts and estimated size without downloading |
+| `--yes` | `-y` | `false` | Skip the confirmation prompt and album picker (download everything) |
+| `--albums` | | | Only download matching albums (comma-separated names, or `all` / `none`) |
+| `--uncategorized` | | `true` | Include photos that are not in any album |
 
 ```bash
 flickrdownloader download -u <url> --out ~/Pictures/flickr --workers 30
+
+# Preview first: album tree, photo counts and estimated size
+flickrdownloader download -u <url> --dry-run
+
+# Only specific albums (names match case-insensitively, exact or substring)
+flickrdownloader download -u <url> --albums "wedding,honeymoon"
+
+# Skip photos that aren't in any album
+flickrdownloader download -u <url> --uncategorized=false
+```
+
+When you run a user download interactively in a terminal, an album picker appears:
+navigate with `↑/↓` (or `j/k`), toggle albums with `space`, select/deselect all with
+`a`/`n`, filter with `/`, then press `enter` to confirm — or `q` to cancel. Use
+`--yes` to bypass the picker and the confirmation prompt.
+
+## Updating
+
+```bash
+flickrdownloader update          # check for a new release and install it
+flickrdownloader update --check  # only check
+flickrdownloader --version       # print the current version
+```
+
+## Shell completions
+
+```bash
+# bash
+source <(flickrdownloader completion bash)
+# zsh
+source <(flickrdownloader completion zsh)
+# fish
+flickrdownloader completion fish | source
+# powershell
+flickrdownloader completion powershell | Out-String | Invoke-Expression
 ```
 
 ## Output layout
@@ -126,6 +170,8 @@ Re-running `download` against the same target skips any file that's already on d
 - Talks to the Flickr REST API directly over OAuth 1.0a (no SDK dependency)
 - A producer goroutine paginates the API while a pool of worker goroutines downloads files concurrently, coordinated with `errgroup`
 - Uses Flickr's `url_o` extra to get the original-quality URL straight from the photo listing, avoiding an extra per-photo API call in the common case; falls back to `flickr.photos.getSizes` for videos or when the owner has disabled original downloads
+- Uses Flickr's `o_dims` extra to estimate download size from original dimensions (used by `--dry-run` and the album picker)
+- Photos that appear in more than one album are downloaded once and hardlinked into the other album folders
 - Two independent rate limiters: one for the Flickr REST API (~1 req/sec, matching Flickr's documented quota) and one for file downloads (scales with `--workers`)
 - Ctrl-C cancels cleanly — in-flight downloads stop and the run reports partial progress
 
@@ -134,6 +180,10 @@ Re-running `download` against the same target skips any file that's already on d
 ```bash
 go build ./...
 go vet ./...
+go test ./...
+
+# Build with a release version stamped in (used by --version and update)
+go build -ldflags "-X main.version=v1.1.0" -o flickrdownloader ./cmd/flickrdownloader
 ```
 
 ## License

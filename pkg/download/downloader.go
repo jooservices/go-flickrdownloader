@@ -289,13 +289,21 @@ func (d *Downloader) downloadPhotosFromPages(
 	ctx context.Context,
 	totalPhotos int,
 	totalPages int,
+	allowIDAbsentSweep bool,
 	fetchPage func(ctx context.Context, page int) ([]api.Photo, error),
 ) Stats {
 	d.progress = ui.NewProgress(totalPhotos)
 	atomic.StoreInt64(&d.currPage, 0)
 	atomic.StoreInt64(&d.totalPages, int64(totalPages))
 
+	// seenIDs records every photo ID at enqueue time so the ID-absent sweep
+	// never removes an artifact for a photo this run actually handled, even
+	// if its worker never got to process the job (C10).
+	seenIDs := make(map[string]bool)
+	allPagesOK := true
+
 	jobs := make(chan api.Photo, d.NumWorkers*2)
+	parentCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
 
 	d.startRenderer(ctx)
@@ -329,6 +337,7 @@ func (d *Downloader) downloadPhotosFromPages(
 
 			photos, err := fetchPage(ctx, page)
 			if err != nil {
+				allPagesOK = false
 				fmt.Fprintf(os.Stderr, "\r\033[K  %s%s API page %d: %v%s\n",
 					ui.ColorRed, ui.IconErr, page, err, ui.ColorReset)
 				continue
@@ -339,6 +348,7 @@ func (d *Downloader) downloadPhotosFromPages(
 				case <-ctx.Done():
 					return ctx.Err()
 				case jobs <- photo:
+					seenIDs[photo.ID] = true
 				}
 			}
 			atomic.StoreInt64(&d.currPage, int64(page))
@@ -346,8 +356,15 @@ func (d *Downloader) downloadPhotosFromPages(
 		return nil
 	})
 
-	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return Stats{}
+	}
+
+	// Sweep only inside a per-album directory whose listing fully succeeded;
+	// a partial listing or a cancelled run must never delete .part/.cand
+	// files (AC-017, BR8).
+	if allowIDAbsentSweep && allPagesOK && parentCtx.Err() == nil {
+		sweepStaleParts(d.OutDir, seenIDs)
 	}
 
 	fmt.Print("\r\033[K")
@@ -416,7 +433,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 		fmt.Printf("\n  %s%s %s %s(%d photos)%s\n",
 			ui.ColorCyan, ui.IconPhoto, setName, ui.ColorDim, total, ui.ColorReset)
 
-		stats := d.downloadPhotosFromPages(ctx, total, pages,
+		stats := d.downloadPhotosFromPages(ctx, total, pages, true,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				var photos []api.Photo
 				if page == 1 {
@@ -496,7 +513,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 		fmt.Printf("\n  %s%s Uncategorized (%d photos)%s\n",
 			ui.ColorCyan, ui.IconPhoto, orphans, ui.ColorReset)
 
-		stats := d.downloadPhotosFromPages(ctx, orphans, 1,
+		stats := d.downloadPhotosFromPages(ctx, orphans, 1, false,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				return orphanPhotos, nil
 			})
@@ -543,7 +560,7 @@ func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) 
 	total := int(firstPage.Photoset.Total)
 	pages := int(firstPage.Photoset.Pages)
 
-	stats := d.downloadPhotosFromPages(ctx, total, pages,
+	stats := d.downloadPhotosFromPages(ctx, total, pages, true,
 		func(ctx context.Context, page int) ([]api.Photo, error) {
 			if page == 1 {
 				return firstPage.Photoset.Photo, nil

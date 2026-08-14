@@ -14,3 +14,7 @@
 # Go
 *.test
 *.out
+
+# ai-infrastructure orchestration state (local only, not part of this repo)
+/.ai/
+/AGENTS.md

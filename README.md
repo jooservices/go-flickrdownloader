@@ -186,6 +186,22 @@ go test ./...
 go build -ldflags "-X main.version=v1.1.0" -o flickrdownloader ./cmd/flickrdownloader
 ```
 
+## Robust downloads
+
+Interrupted or timed-out downloads leave a `{photo-id}.{ext}.part` file on disk. A later run resumes with an HTTP Range request from byte N (the current `.part` size). The HTTP client keeps its **60s** full-request timeout; a timeout mid-body is treated as incomplete and preserves the bytes already written.
+
+Each photo gets at most **3 tries** (1 initial + 2 retries). Backoff is **2s** before try 2 and **4s** before try 3 (plus a small jitter). HTTP 429 may use `Retry-After` instead (capped at 60s).
+
+After a **fully listed** per-album download, an ID-absent sweep removes stale `.part` / `.cand` files whose photo ID was not in that album’s listing. The sweep runs **only** inside those per-album directories, and **never** outside them (for example, uncategorized / owner-root batches are not swept).
+
+### Known limitations
+
+- If Flickr later serves the same photo under a **different extension**, an old `{id}.{old-ext}.part` is not automatically tied to the new final path and can be left behind until a qualifying album sweep (or manual cleanup).
+- **Concurrent CLI instances** writing into the same output tree are unsupported (candidate cleanup assumes one worker owns a photo ID per run).
+- Legacy `{id}.{ext}.tmp` files from older versions are **never resumed**; they are ignored by skip detection and left on disk.
+
+Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md`.
+
 ## License
 
 [MIT](LICENSE)

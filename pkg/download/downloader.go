@@ -2,8 +2,9 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -35,6 +36,9 @@ type Downloader struct {
 	currPage   int64
 	totalPages int64
 	dlLimiter  *rate.Limiter
+	httpClient *http.Client
+	sleep      sleeper
+	jitter     func() float64
 
 	// downloadedPaths records, per photo ID, the path of the first copy
 	// written to disk. Later albums reuse it via hardlinks instead of
@@ -44,8 +48,6 @@ type Downloader struct {
 }
 
 var safeNameRe = regexp.MustCompile(`[<>:"/\\|?*]`)
-
-var downloadHTTPClient = &http.Client{Timeout: 60 * time.Second}
 
 func SafeName(name string) string {
 	name = strings.TrimSpace(name)
@@ -72,6 +74,8 @@ func New(client *api.Client, outDir string, numWorkers int) *Downloader {
 		OutDir:          outDir,
 		NumWorkers:      numWorkers,
 		dlLimiter:       rate.NewLimiter(rate.Limit(numWorkers*2), numWorkers),
+		httpClient:      &http.Client{Timeout: 60 * time.Second},
+		jitter:          func() float64 { return 0.2 * rand.Float64() }, // +0-20% jitter (AC-001)
 		downloadedPaths: make(map[string]string),
 	}
 }
@@ -182,84 +186,32 @@ func httpHint(status int) string {
 }
 
 func (d *Downloader) downloadFile(ctx context.Context, url, filePath string) (int64, error) {
-	if err := d.dlLimiter.Wait(ctx); err != nil {
-		return 0, fmt.Errorf("rate limiter: %w", err)
+	written, err := (fetcher{
+		url:       url,
+		finalPath: filePath,
+		client:    d.httpClient,
+		sleep:     d.sleep,
+		jitter:    d.jitter,
+		beforeAttempt: func(ctx context.Context) error {
+			return d.dlLimiter.Wait(ctx)
+		},
+		maxTries: 3,
+	}).run(ctx)
+	if err != nil {
+		return 0, err
 	}
-
-	tmpPath := filePath + ".tmp"
-
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
-			}
-		}
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return 0, fmt.Errorf("create request: %w", err)
-		}
-
-		resp, err := downloadHTTPClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("http get: %w — hint: check your connection", err)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("http status %d", resp.StatusCode)
-			fmt.Fprintf(os.Stderr, "\r\033[K  %s%s %s — backing off and retrying...%s\n",
-				ui.ColorYellow, ui.IconClock, httpHint(resp.StatusCode), ui.ColorReset)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			h := httpHint(resp.StatusCode)
-			if h != "" {
-				return 0, fmt.Errorf("http status %d — hint: %s", resp.StatusCode, h)
-			}
-			return 0, fmt.Errorf("http status %d", resp.StatusCode)
-		}
-
-		out, err := os.Create(tmpPath)
-		if err != nil {
-			resp.Body.Close()
-			return 0, fmt.Errorf("create file: %w", err)
-		}
-
-		written, err := io.Copy(out, resp.Body)
-		resp.Body.Close()
-		out.Close()
-
-		if err != nil {
-			os.Remove(tmpPath)
-			return 0, fmt.Errorf("write file: %w", err)
-		}
-
-		if err := os.Rename(tmpPath, filePath); err != nil {
-			os.Remove(tmpPath)
-			return 0, fmt.Errorf("rename temp file: %w", err)
-		}
-
-		return written, nil
-	}
-
-	return 0, fmt.Errorf("retry exhausted: %w", lastErr)
+	return written, nil
 }
 
 // alreadyDownloaded reports whether a photo with this ID exists under any
-// extension in OutDir (ignoring stale .tmp files left by an interrupted
-// download), so resuming works regardless of the file's actual media type.
+// extension in OutDir (ignoring incomplete download artifacts), so resuming
+// works regardless of the file's actual media type.
 func (d *Downloader) alreadyDownloaded(photoID string) bool {
 	matches, _ := filepath.Glob(filepath.Join(d.OutDir, photoID+".*"))
 	for _, m := range matches {
-		if !strings.HasSuffix(m, ".tmp") {
+		if !strings.HasSuffix(m, ".part") &&
+			!strings.HasSuffix(m, ".cand") &&
+			!strings.HasSuffix(m, ".tmp") {
 			return true
 		}
 	}
@@ -297,7 +249,9 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 
 	n, err := d.downloadFile(ctx, downloadURL, filePath)
 	if err != nil {
-		d.progress.AddFailure(photo.ID, downloadURL, err.Error())
+		if !errors.Is(err, errCancelled) {
+			d.progress.AddFailure(photo.ID, downloadURL, err.Error())
+		}
 		return
 	}
 
@@ -335,13 +289,21 @@ func (d *Downloader) downloadPhotosFromPages(
 	ctx context.Context,
 	totalPhotos int,
 	totalPages int,
+	allowIDAbsentSweep bool,
 	fetchPage func(ctx context.Context, page int) ([]api.Photo, error),
 ) Stats {
 	d.progress = ui.NewProgress(totalPhotos)
 	atomic.StoreInt64(&d.currPage, 0)
 	atomic.StoreInt64(&d.totalPages, int64(totalPages))
 
+	// seenIDs records every photo ID at enqueue time so the ID-absent sweep
+	// never removes an artifact for a photo this run actually handled, even
+	// if its worker never got to process the job (C10).
+	seenIDs := make(map[string]bool)
+	allPagesOK := true
+
 	jobs := make(chan api.Photo, d.NumWorkers*2)
+	parentCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
 
 	d.startRenderer(ctx)
@@ -375,6 +337,7 @@ func (d *Downloader) downloadPhotosFromPages(
 
 			photos, err := fetchPage(ctx, page)
 			if err != nil {
+				allPagesOK = false
 				fmt.Fprintf(os.Stderr, "\r\033[K  %s%s API page %d: %v%s\n",
 					ui.ColorRed, ui.IconErr, page, err, ui.ColorReset)
 				continue
@@ -385,6 +348,7 @@ func (d *Downloader) downloadPhotosFromPages(
 				case <-ctx.Done():
 					return ctx.Err()
 				case jobs <- photo:
+					seenIDs[photo.ID] = true
 				}
 			}
 			atomic.StoreInt64(&d.currPage, int64(page))
@@ -392,8 +356,15 @@ func (d *Downloader) downloadPhotosFromPages(
 		return nil
 	})
 
-	if err := g.Wait(); err != nil && err != context.Canceled {
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return Stats{}
+	}
+
+	// Sweep only inside a per-album directory whose listing fully succeeded;
+	// a partial listing or a cancelled run must never delete .part/.cand
+	// files (AC-017, BR8).
+	if allowIDAbsentSweep && allPagesOK && parentCtx.Err() == nil {
+		sweepStaleParts(d.OutDir, seenIDs)
 	}
 
 	fmt.Print("\r\033[K")
@@ -462,7 +433,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 		fmt.Printf("\n  %s%s %s %s(%d photos)%s\n",
 			ui.ColorCyan, ui.IconPhoto, setName, ui.ColorDim, total, ui.ColorReset)
 
-		stats := d.downloadPhotosFromPages(ctx, total, pages,
+		stats := d.downloadPhotosFromPages(ctx, total, pages, true,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				var photos []api.Photo
 				if page == 1 {
@@ -542,7 +513,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 		fmt.Printf("\n  %s%s Uncategorized (%d photos)%s\n",
 			ui.ColorCyan, ui.IconPhoto, orphans, ui.ColorReset)
 
-		stats := d.downloadPhotosFromPages(ctx, orphans, 1,
+		stats := d.downloadPhotosFromPages(ctx, orphans, 1, false,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				return orphanPhotos, nil
 			})
@@ -589,7 +560,7 @@ func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) 
 	total := int(firstPage.Photoset.Total)
 	pages := int(firstPage.Photoset.Pages)
 
-	stats := d.downloadPhotosFromPages(ctx, total, pages,
+	stats := d.downloadPhotosFromPages(ctx, total, pages, true,
 		func(ctx context.Context, page int) ([]api.Photo, error) {
 			if page == 1 {
 				return firstPage.Photoset.Photo, nil

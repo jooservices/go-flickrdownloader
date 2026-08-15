@@ -76,7 +76,8 @@ func (p *Progress) AddFailure(id, url, errMsg string) {
 func (p *Progress) Stats() *Stats { return p.stats }
 
 func (p *Progress) completed() int64 {
-	return p.stats.Success + p.stats.Skipped + p.stats.Linked + p.stats.Failed
+	return atomic.LoadInt64(&p.stats.Success) + atomic.LoadInt64(&p.stats.Skipped) +
+		atomic.LoadInt64(&p.stats.Linked) + atomic.LoadInt64(&p.stats.Failed)
 }
 
 func (p *Progress) elapsed() time.Duration { return time.Since(p.start) }

@@ -249,22 +249,28 @@ func TestSnapshotResetAt(t *testing.T) {
 	}
 }
 
-func TestFlushBatching(t *testing.T) {
+// TestWriteThroughPerRequest verifies each accepted request is persisted
+// immediately (not batched), since sibling processes sharing the log must
+// see it on their very next check.
+func TestWriteThroughPerRequest(t *testing.T) {
 	tk, _, path := newTestTracker(t, 1000)
 	ctx := context.Background()
+	if err := tk.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("log should be written through after a single request: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("log lines = %d, want 1", len(lines))
+	}
+
 	for i := 0; i < 59; i++ {
 		if err := tk.Wait(ctx); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("log written before batch threshold (err=%v)", err)
-	}
-	if err := tk.Wait(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := tk.Flush(); err != nil {
-		t.Fatal(err)
 	}
 	tk2, err := New(path, 1000, 0)
 	if err != nil {
@@ -272,5 +278,68 @@ func TestFlushBatching(t *testing.T) {
 	}
 	if got := tk2.Snapshot().Used; got != 60 {
 		t.Fatalf("used = %d, want 60", got)
+	}
+}
+
+// TestInterprocessSharedBudget verifies two Trackers pointed at the same log
+// path share the hourly budget, catching the case where a second Tracker
+// only sees its own in-memory usage instead of reloading combined usage from
+// disk on every request.
+func TestInterprocessSharedBudget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	ctx := context.Background()
+
+	tk1, err := New(path, 3, 0)
+	if err != nil {
+		t.Fatalf("New tk1: %v", err)
+	}
+	tk1.Now = clock.Now
+	tk1.Sleep = clock.Sleep
+
+	tk2, err := New(path, 3, 0)
+	if err != nil {
+		t.Fatalf("New tk2: %v", err)
+	}
+	tk2.Now = clock.Now
+	tk2.Sleep = clock.Sleep
+
+	// tk1 consumes 2 of the shared budget of 3.
+	if err := tk1.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk1.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// tk2 should see only 1 slot left, not a fresh budget of 3.
+	if err := tk2.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	tk2.Sleep = func(ctx context.Context, d time.Duration) error {
+		close(entered)
+		select {
+		case <-release:
+			clock.advance(d)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- tk2.Wait(ctx) }()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tk2's 4th request should have blocked on tk1's shared usage")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
 }

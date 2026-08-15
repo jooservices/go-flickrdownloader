@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jooservices/flickrdownloader/pkg/api"
 	"github.com/jooservices/flickrdownloader/pkg/ui"
@@ -129,6 +130,106 @@ func TestDownloadPhotosFromPagesSweepGates(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStartRendererStopWaitsForExit verifies startRenderer's stop() blocks
+// until its goroutine has actually returned, not just until ctx is
+// cancelled. Without that guarantee, mutating fields the renderer reads
+// (d.progress, d.OutDir) right after stop() — as downloadPhotosFromPages
+// does for the next album — races the goroutine's last in-flight tick.
+func TestStartRendererStopWaitsForExit(t *testing.T) {
+	d := New(nil, t.TempDir(), 1)
+	d.progress = ui.NewProgress(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := d.startRenderer(ctx)
+	cancel()
+	stop()
+
+	// If stop() returned before the goroutine exited, the renderer could
+	// still be reading the old d.progress/d.OutDir here; -race would flag
+	// these writes as racing that read.
+	d.progress = ui.NewProgress(2)
+	d.OutDir = t.TempDir()
+}
+
+// TestConsecutiveAlbumsDoNotRaceRenderer mirrors DownloadByUser's per-album
+// loop: d.OutDir is reassigned and downloadPhotosFromPages is called again
+// immediately after the previous call returns. The renderer goroutine
+// started inside downloadPhotosFromPages must have fully exited by the time
+// it returns, or this reassignment (and the next call's d.progress
+// reassignment) races its reads. The artificial delay in fetchPage ensures
+// the renderer's ticker actually fires at least once per call, so the race
+// window is real rather than skipped by a fast return. Run with -race.
+func TestConsecutiveAlbumsDoNotRaceRenderer(t *testing.T) {
+	d := New(nil, t.TempDir(), 2)
+	ctx := context.Background()
+	fetchPage := func(context.Context, int) ([]api.Photo, error) {
+		time.Sleep(200 * time.Millisecond)
+		return nil, nil
+	}
+
+	for i := 0; i < 3; i++ {
+		d.OutDir = t.TempDir()
+		d.downloadPhotosFromPages(ctx, 0, 1, false, false, fetchPage)
+	}
+}
+
+func TestCollectOrphanPhotosSkipsAlreadyDownloaded(t *testing.T) {
+	firstPage := []api.Photo{{ID: "1"}, {ID: "2"}}
+	downloaded := map[string]bool{"2": true}
+
+	got := collectOrphanPhotos(1, firstPage, downloaded, func(page int) ([]api.Photo, error) {
+		t.Fatalf("fetchPage should not be called for a single-page listing")
+		return nil, nil
+	})
+
+	if len(got) != 1 || got[0].ID != "1" {
+		t.Fatalf("got %+v, want only photo 1", got)
+	}
+}
+
+// TestCollectOrphanPhotosReportsFailedPage verifies a page fetch error is
+// surfaced (stderr message with the page number and cause, plus a closing
+// warning) instead of being silently swallowed, while photos from pages
+// that did succeed are still returned.
+func TestCollectOrphanPhotosReportsFailedPage(t *testing.T) {
+	firstPage := []api.Photo{{ID: "1"}}
+	wantErr := errors.New("boom")
+
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	got := collectOrphanPhotos(3, firstPage, nil, func(page int) ([]api.Photo, error) {
+		switch page {
+		case 2:
+			return nil, wantErr
+		case 3:
+			return []api.Photo{{ID: "3"}}, nil
+		default:
+			t.Fatalf("unexpected page %d", page)
+			return nil, nil
+		}
+	})
+
+	w.Close()
+	os.Stderr = origStderr
+	out, _ := io.ReadAll(r)
+	stderr := string(out)
+
+	if len(got) != 2 || got[0].ID != "1" || got[1].ID != "3" {
+		t.Fatalf("got %+v, want photos 1 and 3 (page 2 failed but shouldn't block the rest)", got)
+	}
+	if !strings.Contains(stderr, "page 2") || !strings.Contains(stderr, "boom") {
+		t.Fatalf("stderr = %q, want it to mention the failed page and cause", stderr)
+	}
+	if !strings.Contains(stderr, "may be missing") {
+		t.Fatalf("stderr = %q, want a closing warning that discovery was incomplete", stderr)
 	}
 }
 

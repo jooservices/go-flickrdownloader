@@ -2,8 +2,11 @@ package update
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +29,9 @@ type Asset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
+	// Digest is a "sha256:<hex>" checksum GitHub computes server-side for
+	// uploaded release assets. Empty for releases predating that feature.
+	Digest string `json:"digest"`
 }
 
 type Release struct {
@@ -78,6 +84,19 @@ func (r *Release) AssetFor() *Asset {
 	return nil
 }
 
+// checksumAsset returns the release's detached checksums file (the
+// convention used by goreleaser and similar tools), or nil if none was
+// published.
+func (r *Release) checksumAsset() *Asset {
+	for i := range r.Assets {
+		n := strings.ToLower(r.Assets[i].Name)
+		if n == "checksums.txt" || n == "sha256sums" || n == "sha256sums.txt" || strings.HasSuffix(n, "_checksums.txt") {
+			return &r.Assets[i]
+		}
+	}
+	return nil
+}
+
 // IsNewer reports whether latest is a newer version than current.
 // Dev builds and empty versions always count as outdated.
 func IsNewer(current, latest string) bool {
@@ -106,10 +125,11 @@ func parseVersion(v string) [3]int {
 	return out
 }
 
-// Install downloads the asset archive, extracts the binary and atomically
-// replaces the currently running executable (keeping a .old backup until the
-// new binary is in place).
-func Install(ctx context.Context, a *Asset) error {
+// Install downloads the asset archive, verifies its integrity against a
+// checksum published alongside the release, extracts the binary and
+// atomically replaces the currently running executable (keeping a .old
+// backup until the new binary is in place).
+func Install(ctx context.Context, rel *Release, a *Asset) error {
 	tmp, err := os.MkdirTemp("", "flickrdownloader-update-")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
@@ -118,6 +138,14 @@ func Install(ctx context.Context, a *Asset) error {
 
 	archivePath := filepath.Join(tmp, "release.tar.gz")
 	if err := downloadAsset(ctx, a, archivePath); err != nil {
+		return err
+	}
+
+	wantSHA256, err := expectedSHA256(ctx, rel, a)
+	if err != nil {
+		return err
+	}
+	if err := verifyChecksum(archivePath, wantSHA256); err != nil {
 		return err
 	}
 
@@ -187,6 +215,101 @@ func downloadAsset(ctx context.Context, a *Asset, dest string) error {
 	return nil
 }
 
+// expectedSHA256 resolves the checksum the downloaded asset must match,
+// preferring the digest GitHub computes for the asset itself and falling
+// back to a detached checksums file published alongside the release.
+// Refuses (rather than silently skipping verification) if neither is
+// available, since a size-only check is trivially forged by an attacker who
+// controls the asset content.
+func expectedSHA256(ctx context.Context, rel *Release, a *Asset) (string, error) {
+	if algo, hex, ok := strings.Cut(a.Digest, ":"); ok {
+		if algo != "sha256" {
+			return "", fmt.Errorf("asset %s: unsupported digest algorithm %q", a.Name, algo)
+		}
+		return strings.ToLower(hex), nil
+	}
+
+	if rel != nil {
+		if cs := rel.checksumAsset(); cs != nil {
+			sums, err := fetchChecksums(ctx, cs)
+			if err != nil {
+				return "", fmt.Errorf("fetch checksums for %s: %w", a.Name, err)
+			}
+			if sum, ok := sums[a.Name]; ok {
+				return sum, nil
+			}
+			return "", fmt.Errorf("asset %s: not listed in %s", a.Name, cs.Name)
+		}
+	}
+
+	return "", fmt.Errorf("no checksum available for %s — refusing to install an unverified binary", a.Name)
+}
+
+// fetchChecksums downloads and parses a "<hex>  <filename>" checksums file
+// (the format goreleaser and `sha256sum` both produce).
+func fetchChecksums(ctx context.Context, cs *Asset) (map[string]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cs.BrowserDownloadURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", BinName)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http status %d", resp.StatusCode)
+	}
+
+	sums := make(map[string]string)
+	sc := bufio.NewScanner(io.LimitReader(resp.Body, 1<<20))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		sums[strings.TrimPrefix(fields[1], "*")] = strings.ToLower(fields[0])
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read checksums: %w", err)
+	}
+	return sums, nil
+}
+
+// verifyChecksum recomputes the SHA-256 of the file at path and compares it
+// (case-insensitively, constant-time is unnecessary here since neither value
+// is a secret) against want.
+func verifyChecksum(path, want string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open archive for checksum: %w", err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("hash archive: %w", err)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if got != strings.ToLower(want) {
+		return fmt.Errorf("checksum mismatch: got %s, expected %s — the download may be corrupt or tampered with", got, want)
+	}
+	return nil
+}
+
+// isBinaryAssetName reports whether an archive entry's base name is the
+// release binary. Real archives (see AssetFor) name the entry after the
+// asset itself, e.g. "flickrdownloader_darwin_arm64" — not the bare
+// "flickrdownloader" — so a plain equality check never matches. Accept
+// either that, or the bare name, with an optional ".exe" suffix.
+func isBinaryAssetName(base string) bool {
+	name := strings.TrimSuffix(base, ".exe")
+	return name == BinName || strings.HasPrefix(name, BinName+"_")
+}
+
 func extractBinary(archivePath, destDir string) (string, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
@@ -214,7 +337,7 @@ func extractBinary(archivePath, destDir string) (string, error) {
 			continue
 		}
 		base := filepath.Base(hdr.Name)
-		if base != BinName && base != BinName+".exe" {
+		if !isBinaryAssetName(base) {
 			continue
 		}
 		binPath = filepath.Join(destDir, base)

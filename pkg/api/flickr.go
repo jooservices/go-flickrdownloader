@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -27,12 +28,19 @@ const (
 	photosPerPage = 500
 )
 
+// RateLimiter gates REST API requests. A persisted quota.Tracker implements
+// it; the default internal limiter paces at ~1 req/sec.
+type RateLimiter interface {
+	Wait(ctx context.Context) error
+}
+
 type Client struct {
 	APIKey       string
 	APISecret    string
 	AccessToken  string
 	AccessSecret string
-	rateLimiter  *rate.Limiter
+	rateLimiter  RateLimiter
+	apiCalls     atomic.Int64
 }
 
 func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
@@ -43,6 +51,35 @@ func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
 		AccessSecret: accessSecret,
 		rateLimiter:  rate.NewLimiter(rate.Every(1050*time.Millisecond), 1),
 	}
+}
+
+// SetRateLimiter replaces the default ~1 req/sec pacing with a custom gate,
+// e.g. a persisted quota tracker enforcing Flickr's 3600/hour cap across runs.
+func (c *Client) SetRateLimiter(rl RateLimiter) { c.rateLimiter = rl }
+
+// RequestCount reports how many REST API calls this client has made.
+func (c *Client) RequestCount() int64 { return c.apiCalls.Load() }
+
+// Quota reports hourly quota usage through the installed rate limiter when it
+// exposes one (zero limit when no tracker is set).
+func (c *Client) Quota() (used, limit int, resetAt time.Time) {
+	if q, ok := c.rateLimiter.(interface {
+		Usage() (int, int, time.Time)
+	}); ok {
+		return q.Usage()
+	}
+	return 0, 0, time.Time{}
+}
+
+// QuotaWaiting reports whether the rate limiter is currently blocked on the
+// hourly cap, and when the next slot frees.
+func (c *Client) QuotaWaiting() (blocked bool, until time.Time) {
+	if q, ok := c.rateLimiter.(interface {
+		Waiting() (bool, time.Time)
+	}); ok {
+		return q.Waiting()
+	}
+	return false, time.Time{}
 }
 
 // flickrHint maps known Flickr error codes to actionable advice.
@@ -81,6 +118,7 @@ func (c *Client) apiGet(ctx context.Context, method string, params map[string]st
 	if err := c.rateLimiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("rate limiter: %w", err)
 	}
+	c.apiCalls.Add(1)
 
 	defaults := map[string]string{
 		"method":         method,

@@ -121,7 +121,7 @@ func TestDownloadPhotosFromPagesSweepGates(t *testing.T) {
 			writeFile(t, cand, []byte("candidate"))
 
 			d := New(nil, dir, 1)
-			d.downloadPhotosFromPages(tt.ctx, 0, 1, tt.allowSweep, tt.fetchPage)
+			d.downloadPhotosFromPages(tt.ctx, 0, 1, tt.allowSweep, false, tt.fetchPage)
 
 			for _, path := range []string{part, cand} {
 				if got := exists(path); got != tt.wantStale {
@@ -203,7 +203,7 @@ func TestCancelledRunKeepsPartialCountsAndDoesNotReportFailure(t *testing.T) {
 	d := New(nil, dir, 1)
 	d.downloadedPaths["link"] = linkedSource
 
-	stats := d.downloadPhotosFromPages(ctx, 2, 2, true, func(_ context.Context, page int) ([]api.Photo, error) {
+	stats := d.downloadPhotosFromPages(ctx, 2, 2, true, false, func(_ context.Context, page int) ([]api.Photo, error) {
 		if page == 1 {
 			return []api.Photo{{ID: "skip"}, {ID: "link"}}, nil
 		}
@@ -249,7 +249,7 @@ func TestSweepPreservesEnqueuedIDArtifacts(t *testing.T) {
 		}, nil
 	})}
 
-	stats := d.downloadPhotosFromPages(context.Background(), 2, 1, true, func(context.Context, int) ([]api.Photo, error) {
+	stats := d.downloadPhotosFromPages(context.Background(), 2, 1, true, false, func(context.Context, int) ([]api.Photo, error) {
 		return []api.Photo{
 			{ID: "active", URLOriginal: "https://example.invalid/active.jpg", Media: "photo"},
 			{ID: "queued", URLOriginal: "https://example.invalid/queued.jpg", Media: "photo"},

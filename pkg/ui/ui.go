@@ -157,6 +157,10 @@ func (p *Progress) Render() string {
 		))
 	}
 
+	if failed := atomic.LoadInt64(&p.stats.Failed); failed > 0 {
+		b.WriteString(fmt.Sprintf("  %s✗ %d failed%s", ColorRed, failed, ColorReset))
+	}
+
 	return b.String()
 }
 
@@ -196,10 +200,38 @@ func (p *Progress) Summary() string {
 	p.stats.mu.Unlock()
 
 	if len(failures) > 0 {
-		b.WriteString(fmt.Sprintf("\n\n  %s%s Failed photos:%s\n", ColorRed, IconErr, ColorReset))
+		b.WriteString(fmt.Sprintf("\n\n  %s%s %d failed photo(s):%s\n", ColorRed, IconErr, len(failures), ColorReset))
+
+		// Group failures by error message so a repeated cause collapses into
+		// one line instead of a wall of identical entries.
+		type group struct {
+			count int
+			ids   []string
+		}
+		groups := map[string]*group{}
+		var order []string
 		for _, f := range failures {
-			b.WriteString(fmt.Sprintf("    %s%s %s — %s%s\n",
-				ColorDim, f.ID, f.URL, f.Err, ColorReset))
+			g, ok := groups[f.Err]
+			if !ok {
+				g = &group{}
+				groups[f.Err] = g
+				order = append(order, f.Err)
+			}
+			g.count++
+			g.ids = append(g.ids, f.ID)
+		}
+		for _, msg := range order {
+			g := groups[msg]
+			b.WriteString(fmt.Sprintf("    %s✗ %d×%s %s%s\n",
+				ColorDim, g.count, ColorBold, msg, ColorReset))
+			const maxIDs = 8
+			if len(g.ids) <= maxIDs {
+				b.WriteString(fmt.Sprintf("      %sphotos: %s%s\n",
+					ColorDim, strings.Join(g.ids, ", "), ColorReset))
+			} else {
+				b.WriteString(fmt.Sprintf("      %sphotos: %s … +%d more%s\n",
+					ColorDim, strings.Join(g.ids[:maxIDs], ", "), len(g.ids)-maxIDs, ColorReset))
+			}
 		}
 	}
 
@@ -244,5 +276,149 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
+// AlbumStat aggregates the outcome of one album (or the uncategorized batch).
+type AlbumStat struct {
+	Name    string
+	Success int64
+	Skipped int64
+	Linked  int64
+	Failed  int64
+	Bytes   int64
+}
+
+// CompletionLine renders the one-line report shown in place of the progress
+// bar once a download finishes.
+func CompletionLine(s AlbumStat) string {
+	done := s.Success + s.Linked
+	noun := "photos"
+	if done == 1 {
+		noun = "photo"
+	}
+	line := fmt.Sprintf("  %s✓ Download complete — %d %s%s",
+		ColorGreen, done, noun, ColorReset)
+	if s.Bytes > 0 {
+		line += fmt.Sprintf(" · %s%s%s", ColorDim, formatBytes(s.Bytes), ColorReset)
+	}
+	if s.Failed > 0 {
+		line += fmt.Sprintf(" · %s✗ %d failed%s", ColorRed, s.Failed, ColorReset)
+	}
+	return line + "\n"
+}
+
+// Breakdown renders the final per-album summary table with a totals row.
+// Rows are the albums in completion order; widths are computed from content.
+func Breakdown(stats []AlbumStat) string {
+	if len(stats) == 0 {
+		return ""
+	}
+	headers := []string{"Album", "ok", "skip", "link", "fail", "size"}
+	const maxNameW = 40
+
+	padRight := func(s string, w int) string {
+		if n := utf8.RuneCountInString(s); n < w {
+			return s + strings.Repeat(" ", w-n)
+		}
+		return s
+	}
+	padLeft := func(s string, w int) string {
+		if n := utf8.RuneCountInString(s); n < w {
+			return strings.Repeat(" ", w-n) + s
+		}
+		return s
+	}
+
+	var totals [5]int64 // ok, skip, link, fail, size
+	rows := make([][]string, len(stats)+1)
+	for i, s := range stats {
+		totals[0] += s.Success
+		totals[1] += s.Skipped
+		totals[2] += s.Linked
+		totals[3] += s.Failed
+		totals[4] += s.Bytes
+
+		name := s.Name
+		if utf8.RuneCountInString(name) > maxNameW {
+			runes := []rune(name)
+			name = string(runes[:maxNameW-1]) + "…"
+		}
+		rows[i] = []string{
+			name,
+			fmt.Sprintf("%d", s.Success),
+			fmt.Sprintf("%d", s.Skipped),
+			fmt.Sprintf("%d", s.Linked),
+			fmt.Sprintf("%d", s.Failed),
+			formatBytes(s.Bytes),
+		}
+	}
+	rows[len(stats)] = []string{
+		"Total",
+		fmt.Sprintf("%d", totals[0]),
+		fmt.Sprintf("%d", totals[1]),
+		fmt.Sprintf("%d", totals[2]),
+		fmt.Sprintf("%d", totals[3]),
+		formatBytes(totals[4]),
+	}
+
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = utf8.RuneCountInString(h)
+	}
+	for _, row := range rows {
+		for c := range row {
+			if n := utf8.RuneCountInString(row[c]); n > widths[c] {
+				widths[c] = n
+			}
+		}
+	}
+
+	sep := "  "
+	var b strings.Builder
+	b.WriteString("\n" + sep)
+	for c, h := range headers {
+		if c > 0 {
+			b.WriteString(sep)
+		}
+		b.WriteString(ColorDim + padRight(h, widths[c]) + ColorReset)
+	}
+	lineW := 0
+	for _, w := range widths {
+		lineW += w
+	}
+	lineW += (len(headers) - 1) * 2
+	b.WriteString("\n" + sep + strings.Repeat("─", lineW) + "\n")
+
+	// Album rows, then a bold totals row.
+	for r, row := range rows {
+		totalRow := r == len(stats)
+		b.WriteString(sep)
+		for c, cell := range row {
+			if c > 0 {
+				b.WriteString(sep)
+			}
+			switch {
+			case c == 0:
+				b.WriteString(ColorBold + padRight(cell, widths[c]) + ColorReset)
+			case totalRow:
+				b.WriteString(ColorBold + padLeft(cell, widths[c]) + ColorReset)
+			case c == 4: // fail
+				if cell != "0" {
+					b.WriteString(ColorRed + padLeft(cell, widths[c]) + ColorReset)
+				} else {
+					b.WriteString(padLeft(cell, widths[c]))
+				}
+			case c == 5: // size
+				b.WriteString(ColorDim + padLeft(cell, widths[c]) + ColorReset)
+			default:
+				b.WriteString(padLeft(cell, widths[c]))
+			}
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // FormatBytes renders a byte count in a human-friendly form.
 func FormatBytes(n int64) string { return formatBytes(n) }
+
+// FormatDuration renders a duration in a human-friendly form.
+func FormatDuration(d time.Duration) string { return formatDuration(d) }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,13 +9,15 @@ import (
 )
 
 type Config struct {
-	APIKey      string `json:"api_key"`
-	APISecret   string `json:"api_secret"`
-	OAuthToken  string `json:"oauth_token"`
-	OAuthSecret string `json:"oauth_token_secret"`
-	NSID        string `json:"nsid,omitempty"`
-	OutputDir   string `json:"output_dir,omitempty"`
-	WorkerCount int    `json:"worker_count,omitempty"`
+	APIKey         string `json:"api_key"`
+	APISecret      string `json:"api_secret"`
+	OAuthToken     string `json:"oauth_token"`
+	OAuthSecret    string `json:"oauth_token_secret"`
+	NSID           string `json:"nsid,omitempty"`
+	OutputDir      string `json:"output_dir,omitempty"`
+	WorkerCount    int    `json:"worker_count,omitempty"`
+	APIHourlyLimit int    `json:"api_hourly_limit,omitempty"`
+	APIRateMS      int    `json:"api_interval_ms,omitempty"`
 }
 
 func configDir() (string, error) {
@@ -59,7 +62,24 @@ func Load() (*Config, error) {
 	if cfg.OutputDir == "" {
 		cfg.OutputDir = "./photos"
 	}
+	if cfg.APIHourlyLimit <= 0 {
+		cfg.APIHourlyLimit = 3600
+	}
+	if cfg.APIRateMS <= 0 {
+		cfg.APIRateMS = 1050
+	}
 	return &cfg, nil
+}
+
+// QuotaPath returns the per-API-key quota log path. Separate keys get
+// separate logs so the hourly budget is tracked independently per key.
+func QuotaPath(apiKey string) (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return filepath.Join(dir, fmt.Sprintf("quota-%x.log", sum[:4])), nil
 }
 
 func (c *Config) Save() error {

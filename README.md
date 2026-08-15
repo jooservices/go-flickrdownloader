@@ -154,7 +154,7 @@ flickrdownloader quota          # show usage + reset time for this hour
 - The plan/dry-run printout estimates the API cost of the job (`~247 calls: 242 listing + ~5 sizes`), whether it fits the remaining budget, and the expected wall time — including pauses when it exceeds the cap.
 - Tune per key in `~/.config/flickrdownloader/config.json` (e.g. a shared key): `"api_hourly_limit": 3600`, `"api_interval_ms": 1050`.
 
-The log is append-only and batched (flush every 60 requests plus on graceful exit), so a hard kill loses at most 60 unrecorded requests and a torn trailing line is ignored on the next load.
+The log is append-only, and each accepted request is written through immediately under an interprocess lock — so two runs sharing the same API key (a manual run and a cron job, say) see each other's usage in real time rather than each getting their own copy of the budget. A torn trailing line from a hard kill is ignored on the next load.
 
 ## Updating
 
@@ -163,6 +163,8 @@ flickrdownloader update          # check for a new release and install it
 flickrdownloader update --check  # only check
 flickrdownloader --version       # print the current version
 ```
+
+Downloaded releases are verified against a SHA-256 checksum before being installed — either the digest GitHub computes for the asset, or a detached checksums file published alongside the release. `update` refuses to install (rather than silently skipping verification) if neither is available.
 
 ## Shell completions
 
@@ -222,10 +224,10 @@ After a **fully listed** per-album download, an ID-absent sweep removes stale `.
 ### Known limitations
 
 - If Flickr later serves the same photo under a **different extension**, an old `{id}.{old-ext}.part` is not automatically tied to the new final path and can be left behind until a qualifying album sweep (or manual cleanup).
-- **Concurrent CLI instances** writing into the same output tree are unsupported (candidate cleanup assumes one worker owns a photo ID per run).
+- **Concurrent CLI instances writing into the same output tree** are unsupported (candidate cleanup assumes one worker owns a photo ID per run). This is separate from the API quota, which *is* safely shared across concurrent runs — see [API quota](#api-quota).
 - Legacy `{id}.{ext}.tmp` files from older versions are **never resumed**; they are ignored by skip detection and left on disk.
 
-Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md`.
+Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update decisions are in `ADR-015.md` … `ADR-017.md`).
 
 ## License
 

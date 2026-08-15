@@ -41,6 +41,37 @@ func nonce() string {
 	return string(b)
 }
 
+// rfc3986Escape percent-encodes s per RFC3986 §2.1, as OAuth1.0a (RFC5849
+// §3.6) requires for the signature base string and signed request
+// parameters. url.QueryEscape is not a substitute: it encodes a space as
+// '+' rather than '%20', so a strict RFC3986 verifier — which decodes the
+// query string (where '+' means space) and then re-encodes per RFC3986 to
+// check the signature — computes a different base string than the one used
+// to sign, and rejects an otherwise-valid request.
+func rfc3986Escape(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if isRFC3986Unreserved(c) {
+			b.WriteByte(c)
+		} else {
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
+}
+
+func isRFC3986Unreserved(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		return true
+	case c == '-' || c == '.' || c == '_' || c == '~':
+		return true
+	}
+	return false
+}
+
 func buildSignature(baseURL string, params map[string]string, consumerSecret, tokenSecret string) string {
 	keys := make([]string, 0, len(params))
 	for k := range params {
@@ -50,11 +81,11 @@ func buildSignature(baseURL string, params map[string]string, consumerSecret, to
 
 	var encodedPairs []string
 	for _, k := range keys {
-		encodedPairs = append(encodedPairs, url.QueryEscape(k)+"="+url.QueryEscape(params[k]))
+		encodedPairs = append(encodedPairs, rfc3986Escape(k)+"="+rfc3986Escape(params[k]))
 	}
 	paramStr := strings.Join(encodedPairs, "&")
 
-	baseStr := "GET&" + url.QueryEscape(baseURL) + "&" + url.QueryEscape(paramStr)
+	baseStr := "GET&" + rfc3986Escape(baseURL) + "&" + rfc3986Escape(paramStr)
 	return hmacSHA1(consumerSecret+"&"+tokenSecret, baseStr)
 }
 
@@ -75,7 +106,7 @@ func OAuthGet(apiKey, consumerSecret, tokenSecret, uri string, extra map[string]
 
 	var encodedPairs []string
 	for k, v := range params {
-		encodedPairs = append(encodedPairs, k+"="+url.QueryEscape(v))
+		encodedPairs = append(encodedPairs, k+"="+rfc3986Escape(v))
 	}
 
 	req, err := http.NewRequest("GET", uri+"?"+strings.Join(encodedPairs, "&"), nil)
@@ -167,7 +198,7 @@ func SignedGet(apiKey, apiSecret, accessToken, accessSecret, uri string, queryPa
 
 	var encodedPairs []string
 	for k, v := range params {
-		encoded := k + "=" + url.QueryEscape(v)
+		encoded := k + "=" + rfc3986Escape(v)
 		encodedPairs = append(encodedPairs, encoded)
 	}
 

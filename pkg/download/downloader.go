@@ -366,8 +366,16 @@ func truncateRunes(s string, w int) string {
 	return string(runes[:max(w-1, 1)]) + "…"
 }
 
-func (d *Downloader) startRenderer(ctx context.Context) {
+// startRenderer starts the progress-line ticker and returns a stop func that
+// blocks until the goroutine has actually exited. Callers must call stop
+// before mutating any field the renderer reads (d.progress, d.OutDir, ...)
+// — ctx cancellation alone only requests the exit, it doesn't wait for it,
+// so a caller that reassigns those fields right after cancelling can still
+// race the renderer's last in-flight tick.
+func (d *Downloader) startRenderer(ctx context.Context) (stop func()) {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(150 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -379,6 +387,7 @@ func (d *Downloader) startRenderer(ctx context.Context) {
 			}
 		}
 	}()
+	return func() { <-done }
 }
 
 func (d *Downloader) downloadPhotosFromPages(
@@ -403,7 +412,7 @@ func (d *Downloader) downloadPhotosFromPages(
 	parentCtx := ctx
 	g, ctx := errgroup.WithContext(ctx)
 
-	d.startRenderer(ctx)
+	stopRenderer := d.startRenderer(ctx)
 
 	for i := 0; i < d.NumWorkers; i++ {
 		g.Go(func() error {
@@ -453,7 +462,13 @@ func (d *Downloader) downloadPhotosFromPages(
 		return nil
 	})
 
-	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	err := g.Wait()
+	// The renderer goroutine only checks ctx.Done() between ticks, so it can
+	// still be mid-render here even though ctx is already cancelled; block
+	// until it has actually exited before returning, since the caller may
+	// immediately reassign d.progress/d.OutDir for the next album.
+	stopRenderer()
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		return Stats{}
 	}
 
@@ -477,6 +492,40 @@ func (d *Downloader) downloadPhotosFromPages(
 		Linked:  d.progress.Stats().Linked,
 		Failed:  d.progress.Stats().Failed,
 	}
+}
+
+// collectOrphanPhotos walks every page of a user's photostream — the first
+// page's photos are supplied directly to avoid a duplicate API call — and
+// returns those not already covered by a photoset. A page fetch error is
+// reported to stderr with the page number and cause, and a closing warning
+// is printed once discovery finishes, rather than silently dropping that
+// page's photos with no indication anything was missed.
+func collectOrphanPhotos(pages int, firstPagePhotos []api.Photo, downloaded map[string]bool, fetchPage func(page int) ([]api.Photo, error)) []api.Photo {
+	var orphans []api.Photo
+	incomplete := false
+	for page := 1; page <= pages; page++ {
+		photos := firstPagePhotos
+		if page > 1 {
+			p, err := fetchPage(page)
+			if err != nil {
+				incomplete = true
+				fmt.Fprintf(os.Stderr, "  %s%s uncategorized photos page %d: %v%s\n",
+					ui.ColorRed, ui.IconErr, page, err, ui.ColorReset)
+				continue
+			}
+			photos = p
+		}
+		for _, p := range photos {
+			if !downloaded[p.ID] {
+				orphans = append(orphans, p)
+			}
+		}
+	}
+	if incomplete {
+		fmt.Fprintf(os.Stderr, "  %s%s some uncategorized photos may be missing from this run — rerun to retry%s\n",
+			ui.ColorYellow, ui.IconErr, ui.ColorReset)
+	}
+	return orphans
 }
 
 // UserDownloadOptions controls DownloadByUser. A nil Sets slice fetches all
@@ -582,25 +631,14 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 			fmt.Printf("    %s- The user's content is private (OAuth is for a different user)%s\n", ui.ColorDim, ui.ColorReset)
 			fmt.Printf("    %s- The NSID resolved incorrectly%s\n", ui.ColorDim, ui.ColorReset)
 		}
-		for page := 1; page <= int(firstPage.Photos.Pages); page++ {
-			if page > 1 {
+		orphanPhotos = collectOrphanPhotos(int(firstPage.Photos.Pages), firstPage.Photos.Photo, downloaded,
+			func(page int) ([]api.Photo, error) {
 				resp, err := d.Client.GetPhotosByUser(ctx, userID, page)
 				if err != nil {
-					continue
+					return nil, err
 				}
-				for _, p := range resp.Photos.Photo {
-					if !downloaded[p.ID] {
-						orphanPhotos = append(orphanPhotos, p)
-					}
-				}
-			} else {
-				for _, p := range firstPage.Photos.Photo {
-					if !downloaded[p.ID] {
-						orphanPhotos = append(orphanPhotos, p)
-					}
-				}
-			}
-		}
+				return resp.Photos.Photo, nil
+			})
 	}
 
 	if len(orphanPhotos) > 0 {

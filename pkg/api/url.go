@@ -30,7 +30,7 @@ func ResolveURL(ctx context.Context, rawURL string, client *Client) (*ParsedURL,
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
 
-	host := strings.TrimPrefix(u.Host, "www.")
+	host := strings.TrimPrefix(strings.ToLower(u.Host), "www.")
 	if host != "flickr.com" && host != "flic.kr" {
 		return nil, fmt.Errorf("not a Flickr URL: %s", rawURL)
 	}

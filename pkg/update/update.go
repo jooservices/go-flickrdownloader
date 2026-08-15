@@ -300,6 +300,16 @@ func verifyChecksum(path, want string) error {
 	return nil
 }
 
+// isBinaryAssetName reports whether an archive entry's base name is the
+// release binary. Real archives (see AssetFor) name the entry after the
+// asset itself, e.g. "flickrdownloader_darwin_arm64" — not the bare
+// "flickrdownloader" — so a plain equality check never matches. Accept
+// either that, or the bare name, with an optional ".exe" suffix.
+func isBinaryAssetName(base string) bool {
+	name := strings.TrimSuffix(base, ".exe")
+	return name == BinName || strings.HasPrefix(name, BinName+"_")
+}
+
 func extractBinary(archivePath, destDir string) (string, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
@@ -327,7 +337,7 @@ func extractBinary(archivePath, destDir string) (string, error) {
 			continue
 		}
 		base := filepath.Base(hdr.Name)
-		if base != BinName && base != BinName+".exe" {
+		if !isBinaryAssetName(base) {
 			continue
 		}
 		binPath = filepath.Join(destDir, base)

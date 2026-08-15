@@ -1,6 +1,8 @@
 package update
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -122,6 +124,87 @@ func TestExpectedSHA256NoneAvailable(t *testing.T) {
 
 	if _, err := expectedSHA256(context.Background(), rel, a); err == nil {
 		t.Fatal("expected Install to refuse when no checksum is available, not silently skip verification")
+	}
+}
+
+func TestIsBinaryAssetName(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"flickrdownloader", true},
+		{"flickrdownloader.exe", true},
+		// Real release archives name the entry after the asset itself
+		// (see AssetFor), not the bare binary name.
+		{"flickrdownloader_darwin_arm64", true},
+		{"flickrdownloader_windows_amd64", true},
+		{"flickrdownloader_windows_amd64.exe", true},
+		{"flickrdownloader-old", false},
+		{"README.md", false},
+		{"LICENSE", false},
+	}
+	for _, c := range cases {
+		if got := isBinaryAssetName(c.name); got != c.want {
+			t.Errorf("isBinaryAssetName(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestExtractBinaryMatchesRealAssetLayout pins extractBinary against the
+// actual archive layout every published release uses (verified against a
+// real v1.2.0 asset): the entry inside the tar.gz is named after the asset
+// itself, e.g. "flickrdownloader_linux_amd64", not the bare binary name.
+// Matching only the bare name here previously made self-update fail on
+// every release with "binary not found in archive".
+func TestExtractBinaryMatchesRealAssetLayout(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "release.tar.gz")
+
+	const want = "fake binary contents"
+	writeTarGz(t, archivePath, map[string]string{
+		"flickrdownloader_linux_amd64": want,
+	})
+
+	binPath, err := extractBinary(archivePath, dir)
+	if err != nil {
+		t.Fatalf("extractBinary: %v", err)
+	}
+	got, err := os.ReadFile(binPath)
+	if err != nil {
+		t.Fatalf("read extracted binary: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("extracted contents = %q, want %q", got, want)
+	}
+}
+
+func writeTarGz(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for name, content := range files {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: name,
+			Mode: 0o755,
+			Size: int64(len(content)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

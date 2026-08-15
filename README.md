@@ -227,7 +227,7 @@ After a **fully listed** per-album download, an ID-absent sweep removes stale `.
 - **Concurrent CLI instances writing into the same output tree** are unsupported (candidate cleanup assumes one worker owns a photo ID per run). This is separate from the API quota, which *is* safely shared across concurrent runs — see [API quota](#api-quota).
 - Legacy `{id}.{ext}.tmp` files from older versions are **never resumed**; they are ignored by skip detection and left on disk.
 
-Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update decisions are in `ADR-015.md` … `ADR-017.md`).
+Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update decisions are in `ADR-015.md` … `ADR-018.md`).
 
 ## License
 

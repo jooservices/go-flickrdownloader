@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jooservices/flickrdownloader/pkg/api"
 	"github.com/jooservices/flickrdownloader/pkg/ui"
@@ -45,6 +46,16 @@ type Downloader struct {
 	// re-downloading the same file (feature: cross-album dedupe).
 	downloadedPaths map[string]string
 	pathMu          sync.Mutex
+
+	// Live status state for the progress renderer: the album currently being
+	// processed and the file currently being written by a worker.
+	currAlbum  atomic.Value // string
+	activeFile string
+	activeMu   sync.Mutex
+
+	// Per-album results for the final breakdown table.
+	albumStats []ui.AlbumStat
+	statsMu    sync.Mutex
 }
 
 var safeNameRe = regexp.MustCompile(`[<>:"/\\|?*]`)
@@ -218,6 +229,61 @@ func (d *Downloader) alreadyDownloaded(photoID string) bool {
 	return false
 }
 
+// setAlbum records the album currently being processed, for the live status
+// line. Called before each album's batch starts.
+func (d *Downloader) setAlbum(name string) { d.currAlbum.Store(name) }
+
+func (d *Downloader) currentAlbum() string {
+	if v, ok := d.currAlbum.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (d *Downloader) setActiveFile(path string) {
+	d.activeMu.Lock()
+	d.activeFile = filepath.Base(path)
+	d.activeMu.Unlock()
+}
+
+func (d *Downloader) clearActiveFile() {
+	d.activeMu.Lock()
+	d.activeFile = ""
+	d.activeMu.Unlock()
+}
+
+func (d *Downloader) currentFile() string {
+	d.activeMu.Lock()
+	defer d.activeMu.Unlock()
+	return d.activeFile
+}
+
+// recordAlbum snapshots the completed batch into the per-album breakdown.
+func (d *Downloader) recordAlbum(name string, p *ui.Progress) ui.AlbumStat {
+	st := p.Stats()
+	stat := ui.AlbumStat{
+		Name:    name,
+		Success: st.Success,
+		Skipped: st.Skipped,
+		Linked:  st.Linked,
+		Failed:  st.Failed,
+		Bytes:   atomic.LoadInt64(&st.Bytes),
+	}
+	d.statsMu.Lock()
+	d.albumStats = append(d.albumStats, stat)
+	d.statsMu.Unlock()
+	return stat
+}
+
+// AlbumStats returns a copy of the per-album results accumulated so far.
+func (d *Downloader) AlbumStats() []ui.AlbumStat {
+	d.statsMu.Lock()
+	defer d.statsMu.Unlock()
+	out := make([]ui.AlbumStat, len(d.albumStats))
+	copy(out, d.albumStats)
+	return out
+}
+
 func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 	if d.alreadyDownloaded(photo.ID) {
 		d.progress.AddSkipped()
@@ -247,6 +313,9 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 
 	filePath := filepath.Join(d.OutDir, photo.ID+"."+ext)
 
+	d.setActiveFile(filePath)
+	defer d.clearActiveFile()
+
 	n, err := d.downloadFile(ctx, downloadURL, filePath)
 	if err != nil {
 		if !errors.Is(err, errCancelled) {
@@ -267,7 +336,34 @@ func (d *Downloader) renderProgressLine() {
 	page := atomic.LoadInt64(&d.currPage)
 	total := atomic.LoadInt64(&d.totalPages)
 	fmt.Printf("\r\033[K%s", d.progress.Render())
+
+	// Quota indicators: a countdown while blocked on the hourly cap, and a
+	// compact usage readout once the hour is nearly spent.
+	if d.Client != nil {
+		if blocked, until := d.Client.QuotaWaiting(); blocked && !until.IsZero() {
+			fmt.Printf("  %s⏳ quota full — next slot in %s%s",
+				ui.ColorYellow, ui.FormatDuration(time.Until(until)), ui.ColorReset)
+		} else if used, limit, _ := d.Client.Quota(); limit > 0 && used*10 >= limit*9 {
+			fmt.Printf("  %sAPI %d/%d%s", ui.ColorYellow, used, limit, ui.ColorReset)
+		}
+	}
+
+	if album := d.currentAlbum(); album != "" {
+		fmt.Printf("  %s%s%s", ui.ColorCyan, truncateRunes(album, 40), ui.ColorReset)
+	}
+	if file := d.currentFile(); file != "" {
+		fmt.Printf("  %s▸ %s%s", ui.ColorDim, truncateRunes(file, 40), ui.ColorReset)
+	}
+
 	fmt.Printf("  %s▸ page %d/%d%s", ui.ColorDim, page, total, ui.ColorReset)
+}
+
+func truncateRunes(s string, w int) string {
+	if utf8.RuneCountInString(s) <= w {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max(w-1, 1)]) + "…"
 }
 
 func (d *Downloader) startRenderer(ctx context.Context) {
@@ -290,6 +386,7 @@ func (d *Downloader) downloadPhotosFromPages(
 	totalPhotos int,
 	totalPages int,
 	allowIDAbsentSweep bool,
+	printCompletion bool,
 	fetchPage func(ctx context.Context, page int) ([]api.Photo, error),
 ) Stats {
 	d.progress = ui.NewProgress(totalPhotos)
@@ -368,7 +465,10 @@ func (d *Downloader) downloadPhotosFromPages(
 	}
 
 	fmt.Print("\r\033[K")
-	fmt.Print(d.progress.Summary())
+	stat := d.recordAlbum(d.currentAlbum(), d.progress)
+	if printCompletion {
+		fmt.Print(ui.CompletionLine(stat))
+	}
 
 	return Stats{
 		Total:   int64(totalPhotos),
@@ -432,8 +532,9 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 		pages := int(firstPage.Photoset.Pages)
 		fmt.Printf("\n  %s%s %s %s(%d photos)%s\n",
 			ui.ColorCyan, ui.IconPhoto, setName, ui.ColorDim, total, ui.ColorReset)
+		d.setAlbum(setName)
 
-		stats := d.downloadPhotosFromPages(ctx, total, pages, true,
+		stats := d.downloadPhotosFromPages(ctx, total, pages, true, false,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				var photos []api.Photo
 				if page == 1 {
@@ -512,8 +613,9 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 
 		fmt.Printf("\n  %s%s Uncategorized (%d photos)%s\n",
 			ui.ColorCyan, ui.IconPhoto, orphans, ui.ColorReset)
+		d.setAlbum("Uncategorized photos")
 
-		stats := d.downloadPhotosFromPages(ctx, orphans, 1, false,
+		stats := d.downloadPhotosFromPages(ctx, orphans, 1, false, false,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				return orphanPhotos, nil
 			})
@@ -556,11 +658,12 @@ func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) 
 	}
 
 	d.OutDir = setDir
+	d.setAlbum(setName)
 
 	total := int(firstPage.Photoset.Total)
 	pages := int(firstPage.Photoset.Pages)
 
-	stats := d.downloadPhotosFromPages(ctx, total, pages, true,
+	stats := d.downloadPhotosFromPages(ctx, total, pages, true, true,
 		func(ctx context.Context, page int) ([]api.Photo, error) {
 			if page == 1 {
 				return firstPage.Photoset.Photo, nil
@@ -589,6 +692,7 @@ func (d *Downloader) DownloadPhoto(ctx context.Context, photoID string) error {
 
 	d.OutDir = dir
 	d.progress = ui.NewProgress(1)
+	d.setAlbum("Photo")
 
 	photo := api.Photo{
 		ID:     info.Photo.ID,
@@ -601,6 +705,6 @@ func (d *Downloader) DownloadPhoto(ctx context.Context, photoID string) error {
 
 	d.worker(ctx, photo)
 	fmt.Print("\r\033[K")
-	fmt.Print(d.progress.Summary())
+	fmt.Print(ui.CompletionLine(d.recordAlbum(d.currentAlbum(), d.progress)))
 	return nil
 }

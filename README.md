@@ -28,7 +28,7 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 - Concurrent downloads with a configurable worker pool
 - Resumable — already-downloaded files are skipped on re-run, regardless of file extension
 - Cross-album dedupe — a photo present in several albums is downloaded once and hardlinked into the others
-- Respects Flickr's API rate limits automatically
+- Enforces Flickr's **3600 requests/hour API quota across runs** — a persisted rolling window per API key pauses requests at the cap and shows usage, reset time and an API-cost estimate for each plan
 - Handles both photos and videos, always fetching the original quality available
 - Live progress bar with ETA and transfer speed
 - Actionable error messages — Flickr error codes come with hints telling you what to do
@@ -131,6 +131,31 @@ navigate with `↑/↓` (or `j/k`), toggle albums with `space`, select/deselect 
 `a`/`n`, filter with `/`, then press `enter` to confirm — or `q` to cancel. Use
 `--yes` to bypass the picker and the confirmation prompt.
 
+## API quota
+
+Flickr caps REST API usage at **3600 requests per hour** per API key. `flickrdownloader` tracks this with a *rolling* 1-hour window persisted in
+`~/.config/flickrdownloader/quota-<key-hash>.log` — one timestamp per request — so **separate runs in the same hour share the same budget**.
+
+```bash
+flickrdownloader quota          # show usage + reset time for this hour
+```
+
+```text
+╔═════════════╗
+║  API Quota  ║
+╚═════════════╝
+
+  Used:      123 / 3600  (3%)
+  Window:    oldest request expires in 42m
+```
+
+- When the cap is reached, requests pause until the oldest entry expires (the progress bar shows a `quota full — next slot in …` countdown instead of the page indicator). Ctrl-C aborts the wait cleanly.
+- The header of every `download` run shows the hourly usage, and the final summary reports `API calls this run`.
+- The plan/dry-run printout estimates the API cost of the job (`~247 calls: 242 listing + ~5 sizes`), whether it fits the remaining budget, and the expected wall time — including pauses when it exceeds the cap.
+- Tune per key in `~/.config/flickrdownloader/config.json` (e.g. a shared key): `"api_hourly_limit": 3600`, `"api_interval_ms": 1050`.
+
+The log is append-only and batched (flush every 60 requests plus on graceful exit), so a hard kill loses at most 60 unrecorded requests and a torn trailing line is ignored on the next load.
+
 ## Updating
 
 ```bash
@@ -172,7 +197,7 @@ Re-running `download` against the same target skips any file that's already on d
 - Uses Flickr's `url_o` extra to get the original-quality URL straight from the photo listing, avoiding an extra per-photo API call in the common case; falls back to `flickr.photos.getSizes` for videos or when the owner has disabled original downloads
 - Uses Flickr's `o_dims` extra to estimate download size from original dimensions (used by `--dry-run` and the album picker)
 - Photos that appear in more than one album are downloaded once and hardlinked into the other album folders
-- Two independent rate limiters: one for the Flickr REST API (~1 req/sec, matching Flickr's documented quota) and one for file downloads (scales with `--workers`)
+- Two independent rate limiters: one for the Flickr REST API (~1 req/sec, matching Flickr's documented quota) and one for file downloads (scales with `--workers`); a persisted per-key quota tracker additionally enforces the 3600 requests/hour cap across runs
 - Ctrl-C cancels cleanly — in-flight downloads stop and the run reports partial progress
 
 ## Development

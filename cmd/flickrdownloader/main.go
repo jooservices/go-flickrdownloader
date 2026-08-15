@@ -9,10 +9,12 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jooservices/flickrdownloader/pkg/api"
 	"github.com/jooservices/flickrdownloader/pkg/config"
 	"github.com/jooservices/flickrdownloader/pkg/download"
+	"github.com/jooservices/flickrdownloader/pkg/quota"
 	"github.com/jooservices/flickrdownloader/pkg/ui"
 	"github.com/jooservices/flickrdownloader/pkg/update"
 	"github.com/spf13/cobra"
@@ -93,6 +95,12 @@ func main() {
 	}
 	updateCmd.Flags().BoolVar(&updateCheckOnly, "check", false, "Only check for a newer version, do not install")
 
+	quotaCmd := &cobra.Command{
+		Use:   "quota",
+		Short: "Show Flickr API quota usage for this hour",
+		RunE:  runQuota,
+	}
+
 	completionCmd := &cobra.Command{
 		Use:       "completion [bash|zsh|fish|powershell]",
 		Short:     "Generate shell completion script",
@@ -117,6 +125,7 @@ func main() {
 	rootCmd.AddCommand(authCmd)
 	rootCmd.AddCommand(downloadCmd)
 	rootCmd.AddCommand(updateCmd)
+	rootCmd.AddCommand(quotaCmd)
 	rootCmd.AddCommand(completionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -215,13 +224,15 @@ func runAuth(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := &config.Config{
-		APIKey:      apiKey,
-		APISecret:   apiSecret,
-		OAuthToken:  accessToken,
-		OAuthSecret: accessSecret,
-		NSID:        userNSID,
-		WorkerCount: 20,
-		OutputDir:   "./photos",
+		APIKey:         apiKey,
+		APISecret:      apiSecret,
+		OAuthToken:     accessToken,
+		OAuthSecret:    accessSecret,
+		NSID:           userNSID,
+		WorkerCount:    20,
+		OutputDir:      "./photos",
+		APIHourlyLimit: quota.DefaultHourlyLimit,
+		APIRateMS:      int(quota.DefaultInterval / time.Millisecond),
 	}
 
 	if err := cfg.Save(); err != nil {
@@ -245,6 +256,57 @@ func confirm(prompt string) bool {
 
 // matchSets maps a --albums spec ("all", "none", or comma-separated names,
 // exact or substring, case-insensitive) onto the fetched album list.
+// newQuotaTracker builds the persisted per-API-key quota tracker from cfg.
+func newQuotaTracker(cfg *config.Config) (*quota.Tracker, error) {
+	qPath, err := config.QuotaPath(cfg.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	tr, err := quota.New(qPath, cfg.APIHourlyLimit, time.Duration(cfg.APIRateMS)*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("init quota tracker: %w", err)
+	}
+	return tr, nil
+}
+
+func runQuota(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	tr, err := newQuotaTracker(cfg)
+	if err != nil {
+		return err
+	}
+
+	s := tr.Snapshot()
+	pct := 0.0
+	if s.Limit > 0 {
+		pct = float64(s.Used) / float64(s.Limit) * 100
+	}
+	col := ui.ColorGreen
+	if s.Used*10 >= s.Limit*8 {
+		col = ui.ColorYellow
+	}
+	if s.Used >= s.Limit {
+		col = ui.ColorRed
+	}
+
+	fmt.Printf("\n%s\n\n", ui.Bordered("API Quota", ui.ColorCyan))
+	fmt.Printf("  %sUsed:%s      %d / %d  (%.0f%%)\n", ui.ColorDim, ui.ColorReset, s.Used, s.Limit, pct)
+	if s.Waiting && !s.WaitUntil.IsZero() {
+		fmt.Printf("  %sBlocked:%s   %squota full — next slot in %s%s\n",
+			ui.ColorDim, ui.ColorReset, ui.ColorYellow, ui.FormatDuration(time.Until(s.WaitUntil)), ui.ColorReset)
+	}
+	if s.ResetAt.IsZero() {
+		fmt.Printf("  %sWindow:%s    empty — full budget available\n", ui.ColorDim, ui.ColorReset)
+	} else if wait := time.Until(s.ResetAt); wait > 0 {
+		fmt.Printf("  %sRolls:%s     oldest request expires in %s%s%s\n",
+			ui.ColorDim, ui.ColorReset, col, ui.FormatDuration(wait), ui.ColorReset)
+	}
+	return nil
+}
+
 func matchSets(sets []api.PhotoSetInfo, spec string) ([]api.PhotoSetInfo, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -307,7 +369,19 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		cfg.OutputDir = outDir
 	}
 
+	tr, err := newQuotaTracker(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := tr.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s%s flush quota log: %v%s\n",
+				ui.ColorRed, ui.IconErr, err, ui.ColorReset)
+		}
+	}()
+
 	client := api.NewClient(cfg.APIKey, cfg.APISecret, cfg.OAuthToken, cfg.OAuthSecret)
+	client.SetRateLimiter(tr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -320,17 +394,20 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		cancel()
 	}()
 
+	fmt.Printf("\n%s\n\n", ui.Bordered("Flickr Downloader", ui.ColorCyan))
 	fmt.Printf("  %sResolving URL...%s\n", ui.ColorDim, ui.ColorReset)
 	parsed, err := api.ResolveURL(ctx, urlFlag, client)
 	if err != nil {
 		return fmt.Errorf("resolve URL '%s': %w", urlFlag, err)
 	}
 
-	fmt.Printf("\n%s\n\n", ui.Bordered("Flickr Downloader", ui.ColorCyan))
-	fmt.Printf("  %sURL:%s    %s\n", ui.ColorDim, ui.ColorReset, urlFlag)
+	fmt.Printf("\n  %sURL:%s    %s\n", ui.ColorDim, ui.ColorReset, urlFlag)
+
+	printQuotaHeader(client)
 
 	dl := download.New(client, cfg.OutputDir, cfg.WorkerCount)
 
+	var runErr error
 	switch parsed.Type {
 	case api.TargetPhoto:
 		info, err := client.GetPhotoInfo(ctx, parsed.ID)
@@ -348,7 +425,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		return dl.DownloadPhoto(ctx, parsed.ID)
+		runErr = dl.DownloadPhoto(ctx, parsed.ID)
 
 	case api.TargetPhotoset:
 		psInfo, err := client.GetPhotosetInfo(ctx, parsed.ID)
@@ -366,15 +443,50 @@ func runDownload(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
-		fmt.Printf("  %sDownloading...%s\n\n", ui.ColorDim, ui.ColorReset)
-		_, err = dl.DownloadByPhotoset(ctx, parsed.ID)
-		return err
+		fmt.Printf("  %sDownloading...%s\n", ui.ColorDim, ui.ColorReset)
+		_, runErr = dl.DownloadByPhotoset(ctx, parsed.ID)
 
 	case api.TargetUser:
-		return runUserDownload(ctx, dl, client, parsed.ID)
+		runErr = runUserDownload(ctx, dl, client, parsed.ID)
 	}
 
-	return nil
+	// Per-album breakdown table, then the API cost of the run.
+	fmt.Print(ui.Breakdown(dl.AlbumStats()))
+	printRunSummary(client)
+	return runErr
+}
+
+// printQuotaHeader shows the persisted hourly usage at the start of a run.
+func printQuotaHeader(client *api.Client) {
+	used, limit, resetAt := client.Quota()
+	if limit <= 0 {
+		return
+	}
+	col := ui.ColorGreen
+	if used*10 >= limit*8 {
+		col = ui.ColorYellow
+	}
+	fmt.Printf("  %sAPI quota:%s %d/%d used this hour", col, ui.ColorReset, used, limit)
+	if used > 0 && !resetAt.IsZero() {
+		if wait := time.Until(resetAt); wait > 0 {
+			fmt.Printf(" · %soldest request expires in %s%s", ui.ColorDim, ui.FormatDuration(wait), ui.ColorReset)
+		}
+	}
+	fmt.Println()
+}
+
+// printRunSummary reports the API cost of the finished run.
+func printRunSummary(client *api.Client) {
+	n := client.RequestCount()
+	if n == 0 {
+		return
+	}
+	line := fmt.Sprintf("\n  %sAPI calls this run:%s %d", ui.ColorDim, ui.ColorReset, n)
+	if used, limit, _ := client.Quota(); limit > 0 {
+		line += fmt.Sprintf(" · %d/%d used this hour (%d left)",
+			used, limit, max(limit-used, 0))
+	}
+	fmt.Println(line)
 }
 
 func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.Client, nsid string) error {
@@ -432,7 +544,7 @@ func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.C
 	}
 
 	// Show the plan: album tree with selections and estimated sizes.
-	printPlan(sets, selected, includeOrphans, firstPage, totalPhotos, showSelections)
+	printPlan(client, sets, selected, includeOrphans, firstPage, totalPhotos, showSelections)
 
 	if dryRun {
 		fmt.Printf("\n  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
@@ -446,7 +558,7 @@ func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.C
 		}
 	}
 
-	fmt.Printf("\n  %sDownloading...%s\n\n", ui.ColorDim, ui.ColorReset)
+	fmt.Printf("\n  %sDownloading albums...%s\n", ui.ColorDim, ui.ColorReset)
 	_, err = dl.DownloadByUser(ctx, nsid, download.UserDownloadOptions{
 		Sets:           selected,
 		FirstPage:      firstPage,
@@ -497,7 +609,7 @@ func buildPickerItems(sets []api.PhotoSetInfo, firstPage *api.PhotosResponse, to
 	return items
 }
 
-func printPlan(sets, selected []api.PhotoSetInfo, includeOrphans bool, firstPage *api.PhotosResponse, totalPhotos int, showSelections bool) {
+func printPlan(client *api.Client, sets, selected []api.PhotoSetInfo, includeOrphans bool, firstPage *api.PhotosResponse, totalPhotos int, showSelections bool) {
 	avg := download.AvgPhotoBytes(firstPage.Photos.Photo)
 	selectedByID := map[string]bool{}
 	for _, s := range selected {
@@ -561,4 +673,80 @@ func printPlan(sets, selected []api.PhotoSetInfo, includeOrphans bool, firstPage
 		total += fmt.Sprintf(" · ~%s estimated", ui.FormatBytes(extrapolated))
 	}
 	fmt.Printf("\n  %sTotal:%s %s\n", ui.ColorBold, ui.ColorReset, total)
+	printAPIEstimate(client, selected, includeOrphans, totalPhotos, firstPage)
+}
+
+// estimateAPICalls predicts the REST requests still needed to list and
+// download the selected albums and orphans, using only data already fetched
+// during discovery. Listing pages are exact (counts come from the photoset
+// list and the photostream total); getSizes fallbacks are estimated from the
+// sampled fraction of photos lacking url_o (videos or originals disabled),
+// which is what forces a sizes call.
+func estimateAPICalls(selected []api.PhotoSetInfo, includeOrphans bool, totalPhotos int, firstPage *api.PhotosResponse) (listing, sizes int) {
+	const perPage = 500
+	var toDownload int
+	for _, s := range selected {
+		n := int(s.Photos)
+		toDownload += n
+		listing += (n + perPage - 1) / perPage
+	}
+	if includeOrphans {
+		if orphans := totalPhotos - toDownload; orphans > 0 {
+			toDownload += orphans
+		}
+		// The orphan scan re-paginates the photostream; page 1 is cached.
+		if pages := (totalPhotos + perPage - 1) / perPage; pages > 1 {
+			listing += pages - 1
+		}
+	}
+
+	frac, known := 0.0, 0
+	for _, p := range firstPage.Photos.Photo {
+		known++
+		if p.Media == "video" || p.URLOriginal == "" {
+			frac++
+		}
+	}
+	if known > 0 {
+		sizes = int(float64(toDownload) * frac / float64(known))
+	}
+	return listing, sizes
+}
+
+// printAPIEstimate shows the predicted API cost of the plan against the
+// remaining hourly budget, plus a wall-clock estimate at the interval pace
+// (including pauses at the cap when the plan exceeds the budget).
+func printAPIEstimate(client *api.Client, selected []api.PhotoSetInfo, includeOrphans bool, totalPhotos int, firstPage *api.PhotosResponse) {
+	used, limit, _ := client.Quota()
+	if limit <= 0 {
+		return
+	}
+	listing, sizes := estimateAPICalls(selected, includeOrphans, totalPhotos, firstPage)
+	total := listing + sizes
+	remaining := limit - used
+
+	var status string
+	col := ui.ColorGreen
+	if total > remaining {
+		col = ui.ColorYellow
+		status = fmt.Sprintf("✗ exceeds remaining — will pause at the %d cap", limit)
+	} else {
+		status = "✓ fits within the hourly quota"
+	}
+
+	pace := 1050.0 // ms per request (the interval limiter)
+	wall := time.Duration(float64(total) * pace * float64(time.Millisecond))
+	if total > remaining {
+		pauses := (total - remaining + limit - 1) / limit
+		wall += time.Duration(pauses) * time.Hour
+	}
+
+	fmt.Printf("\n  %sEstimated API calls:%s ~%d (%d listing + ~%d sizes)\n",
+		ui.ColorBold, ui.ColorReset, total, listing, sizes)
+	fmt.Printf("  %sRemaining this hour:%s %d · %s%s%s\n",
+		ui.ColorBold, ui.ColorReset, remaining, col, status, ui.ColorReset)
+	if total > 0 {
+		fmt.Printf("  %sEst. wall time:%s %s\n",
+			ui.ColorBold, ui.ColorReset, ui.FormatDuration(wall))
+	}
 }

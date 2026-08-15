@@ -3,9 +3,16 @@
 // timestamps per API key in an append-only log, and blocks requests once the
 // hourly cap is reached until the oldest entry expires.
 //
-// The log is written with O_APPEND in batches (never rewritten during normal
-// operation), so a hard kill loses at most flushBatch unrecorded requests and
-// a torn trailing line is simply ignored on the next load.
+// Concurrent processes sharing the same log path (e.g. a manual run and a
+// cron job using the same API key) coordinate through an OS-level advisory
+// lock (flock) on a sibling "<path>.lock" file: every accept/deny decision
+// re-reads the shared log under that lock and, if the request is accepted,
+// writes it through immediately. That keeps the hourly cap correct across
+// all of them, at the cost of a small file read/write per request — cheap
+// next to the ~1/sec pacing already applied. flock is held for the current
+// process's lifetime only, so a crash or kill releases it automatically;
+// there's no stale-lock case to clean up. A torn trailing line from a hard
+// kill mid-write is simply ignored on the next read.
 package quota
 
 import (
@@ -19,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofrs/flock"
 	"golang.org/x/time/rate"
 )
 
@@ -32,13 +40,13 @@ const DefaultInterval = 1050 * time.Millisecond
 // window is the rolling window of the hourly quota.
 const window = time.Hour
 
-// flushBatch flushes the quota log at most once per this many requests, so a
-// hard kill loses at most 60 unrecorded requests (~1.7% of the hourly cap).
-const flushBatch = 60
-
 // compactStaleThreshold rewrites the log at load time once this many lines
 // were older than the window (crash residue / long-lived installs).
 const compactStaleThreshold = 10000
+
+// lockRetryDelay is how often TryLockContext polls for the interprocess
+// lock while waiting for another process to release it.
+const lockRetryDelay = 25 * time.Millisecond
 
 // Snapshot is a point-in-time view of quota usage for the UI.
 type Snapshot struct {
@@ -55,8 +63,9 @@ type Snapshot struct {
 type Tracker struct {
 	mu      sync.Mutex
 	path    string
-	entries []int64 // epoch seconds inside the rolling window
-	flushed int     // number of entries already written to disk
+	flock   *flock.Flock // interprocess lock guarding path; nil when path == ""
+	entries []int64      // epoch seconds inside the rolling window
+	flushed int          // number of entries already written to disk
 	limit   int
 	rate    *rate.Limiter // per-request pacing; nil disables it
 
@@ -79,6 +88,9 @@ func New(path string, hourlyLimit int, interval time.Duration) (*Tracker, error)
 		limit: hourlyLimit,
 		Now:   time.Now,
 	}
+	if path != "" {
+		t.flock = flock.New(path + ".lock")
+	}
 	if interval > 0 {
 		t.rate = rate.NewLimiter(rate.Every(interval), 1)
 	}
@@ -90,8 +102,10 @@ func New(path string, hourlyLimit int, interval time.Duration) (*Tracker, error)
 
 // Wait blocks until a request is allowed by both the per-request interval and
 // the hourly cap, then records the request. When the cap is reached it waits
-// until the oldest entry expires (rolling window). ctx cancellation aborts
-// the wait. It is safe for concurrent use.
+// until the oldest entry expires (rolling window). Each attempt re-reads the
+// shared log under the interprocess lock (see the package doc), so the cap
+// is enforced across every process sharing this path, not just this one.
+// ctx cancellation aborts the wait. It is safe for concurrent use.
 func (t *Tracker) Wait(ctx context.Context) error {
 	if t.rate != nil {
 		if err := t.rate.Wait(ctx); err != nil {
@@ -101,27 +115,25 @@ func (t *Tracker) Wait(ctx context.Context) error {
 
 	for {
 		now := t.Now()
-		t.mu.Lock()
-		t.trimLocked(now)
-		if len(t.entries) < t.limit {
-			ts := now.Unix()
-			t.entries = append(t.entries, ts)
-			t.waiting = false
-			err := t.maybeFlushLocked()
-			t.mu.Unlock()
+		recorded, wait, err := t.tryRecord(ctx, now)
+		if err != nil {
 			return err
 		}
-
-		next := t.entries[0] + int64(window/time.Second) - now.Unix()
-		if next <= 0 {
-			t.mu.Unlock()
+		if recorded {
+			return nil
+		}
+		if wait <= 0 {
+			// The blocking entry expired between the check and now (clock
+			// rounding) — retry immediately rather than sleeping for 0.
 			continue
 		}
+
+		t.mu.Lock()
 		t.waiting = true
-		t.waitUntil = now.Add(time.Duration(next) * time.Second)
+		t.waitUntil = now.Add(wait)
 		t.mu.Unlock()
 
-		err := t.sleepWith(ctx, time.Duration(next)*time.Second)
+		err = t.sleepWith(ctx, wait)
 		t.mu.Lock()
 		t.waiting = false
 		t.mu.Unlock()
@@ -131,9 +143,67 @@ func (t *Tracker) Wait(ctx context.Context) error {
 	}
 }
 
-// Flush writes any unflushed request timestamps to the log. Call it on
-// graceful exit (e.g. defer) so a hard kill loses at most flushBatch entries.
+// tryRecord attempts, under the interprocess lock, to record one request
+// against the shared quota log: it reloads the authoritative on-disk state,
+// and either accepts the request (writing it through immediately) or reports
+// how long until the oldest entry frees a slot.
+func (t *Tracker) tryRecord(ctx context.Context, now time.Time) (recorded bool, wait time.Duration, err error) {
+	if t.flock != nil {
+		locked, lockErr := t.flock.TryLockContext(ctx, lockRetryDelay)
+		if lockErr != nil {
+			return false, 0, fmt.Errorf("lock quota log: %w", lockErr)
+		}
+		if !locked {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, 0, ctxErr
+			}
+			return false, 0, fmt.Errorf("lock quota log: timed out")
+		}
+		defer t.flock.Unlock()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.path != "" {
+		if err := t.rawLoadLocked(now); err != nil {
+			return false, 0, err
+		}
+	} else {
+		t.trimLocked(now)
+	}
+
+	if len(t.entries) < t.limit {
+		t.entries = append(t.entries, now.Unix())
+		t.waiting = false
+		if err := t.flushLocked(); err != nil {
+			return false, 0, err
+		}
+		return true, 0, nil
+	}
+
+	next := t.entries[0] + int64(window/time.Second) - now.Unix()
+	if next < 0 {
+		next = 0
+	}
+	return false, time.Duration(next) * time.Second, nil
+}
+
+// Flush writes any unflushed request timestamps to the log. Wait already
+// writes through synchronously, so under normal operation there is nothing
+// pending; this remains as a safety net for callers that mutate entries
+// outside Wait.
 func (t *Tracker) Flush() error {
+	if t.flock != nil {
+		locked, err := t.flock.TryLockContext(context.Background(), lockRetryDelay)
+		if err != nil {
+			return fmt.Errorf("lock quota log: %w", err)
+		}
+		if !locked {
+			return fmt.Errorf("lock quota log: timed out")
+		}
+		defer t.flock.Unlock()
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.flushLocked()
@@ -168,20 +238,44 @@ func (t *Tracker) Waiting() (blocked bool, until time.Time) {
 	return s.Waiting, s.WaitUntil
 }
 
+// load performs the initial read of any persisted usage at startup, under
+// the interprocess lock so it never races a sibling process's write.
 func (t *Tracker) load() error {
 	if t.path == "" {
 		return nil
 	}
+	if t.flock != nil {
+		locked, err := t.flock.TryLockContext(context.Background(), lockRetryDelay)
+		if err != nil {
+			return fmt.Errorf("lock quota log: %w", err)
+		}
+		if !locked {
+			return fmt.Errorf("lock quota log: timed out")
+		}
+		defer t.flock.Unlock()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rawLoadLocked(t.Now())
+}
+
+// rawLoadLocked replaces the in-memory entry set with what's live on disk as
+// of now, discarding anything outside the rolling window. The caller holds
+// mu and, other than at construction, the interprocess flock — so this
+// always reflects the combined usage of every process sharing the log.
+func (t *Tracker) rawLoadLocked(now time.Time) error {
 	f, err := os.Open(t.path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			t.entries = nil
+			t.flushed = 0
 			return nil
 		}
 		return fmt.Errorf("open quota log: %w", err)
 	}
 	defer f.Close()
 
-	cutoff := t.Now().Unix() - int64(window/time.Second)
+	cutoff := now.Unix() - int64(window/time.Second)
 	var kept []int64
 	var stale int
 	sc := bufio.NewScanner(f)
@@ -229,13 +323,6 @@ func (t *Tracker) trimLocked(now time.Time) {
 			t.flushed -= keep
 		}
 	}
-}
-
-func (t *Tracker) maybeFlushLocked() error {
-	if len(t.entries)-t.flushed < flushBatch {
-		return nil
-	}
-	return t.flushLocked()
 }
 
 // flushLocked appends every entry after the flush cursor. The caller holds mu.

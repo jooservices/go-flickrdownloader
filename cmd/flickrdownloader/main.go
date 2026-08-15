@@ -166,7 +166,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("  Downloading %s (%.1f MB)...\n", asset.Name, float64(asset.Size)/1e6)
-	if err := update.Install(ctx, asset); err != nil {
+	if err := update.Install(ctx, rel, asset); err != nil {
 		return err
 	}
 	fmt.Printf("  %s%s Updated to %s%s\n", ui.ColorGreen, ui.IconOk, latest, ui.ColorReset)

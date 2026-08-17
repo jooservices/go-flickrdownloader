@@ -1,0 +1,30 @@
+# systemd user service for `flickrdownloader watch`.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp flickrdownloader-watch.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now flickrdownloader-watch
+#
+# Logs:
+#   journalctl --user -u flickrdownloader-watch -f
+#   # or, since --log-file is also set below:
+#   tail -f ~/.local/state/flickrdownloader/watch.log
+#
+# Keep it running after logout (optional):
+#   loginctl enable-linger "$USER"
+
+[Unit]
+Description=flickrdownloader watch — continuous Flickr photo sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p %h/.local/state/flickrdownloader
+ExecStart=%h/.local/bin/flickrdownloader watch --quiet --log-file %h/.local/state/flickrdownloader/watch.log
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target

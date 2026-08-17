@@ -29,6 +29,10 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 - Resumable — already-downloaded files are skipped on re-run, regardless of file extension
 - Cross-album dedupe — a photo present in several albums is downloaded once and hardlinked into the others
 - Enforces Flickr's **3600 requests/hour API quota across runs** — a persisted rolling window per API key pauses requests at the cap and shows usage, reset time and an API-cost estimate for each plan
+- Account-scoped **response cache** — repeat runs reuse cached listings instead of re-fetching them, with `--refresh` / `--offline` to control that explicitly
+- **`verify`** — check downloaded photos against completion manifests without downloading or hitting the API
+- **`watch`** — a long-running mode that polls a watchlist file and downloads new photos forever, waiting out quota/rate limits instead of exiting
+- **Output-root lock** — safe to run `download`/`verify`/`watch` concurrently against different output trees; a second process against the *same* tree is rejected instead of racing
 - Handles both photos and videos, always fetching the original quality available
 - Live progress bar with ETA and transfer speed
 - Actionable error messages — Flickr error codes come with hints telling you what to do
@@ -112,6 +116,8 @@ flickrdownloader download -u https://www.flickr.com/photos/someuser/52968474408
 | `--yes` | `-y` | `false` | Skip the confirmation prompt and album picker (download everything) |
 | `--albums` | | | Only download matching albums (comma-separated names, or `all` / `none`) |
 | `--uncategorized` | | `true` | Include photos that are not in any album |
+| `--refresh` | | `false` | Bypass cached metadata and completion manifests; re-check everything against Flickr |
+| `--offline` | | `false` | Use cached responses only; never make a live request (fails if nothing is cached) |
 
 ```bash
 flickrdownloader download -u <url> --out ~/Pictures/flickr --workers 30
@@ -155,6 +161,80 @@ flickrdownloader quota          # show usage + reset time for this hour
 - Tune per key in `~/.config/flickrdownloader/config.json` (e.g. a shared key): `"api_hourly_limit": 3600`, `"api_interval_ms": 1050`.
 
 The log is append-only, and each accepted request is written through immediately under an interprocess lock — so two runs sharing the same API key (a manual run and a cron job, say) see each other's usage in real time rather than each getting their own copy of the budget. A torn trailing line from a hard kill is ignored on the next load.
+
+## Response cache
+
+Every successful Flickr REST response is cached in a small, account-scoped SQLite database at `~/.config/flickrdownloader/cache-<hash>.db` (0600 permissions; separate accounts get separate databases, and re-authenticating as a different account invalidates it automatically). This is what powers `verify` and lets repeat runs against the same albums skip re-listing photos that were already fully downloaded.
+
+- Listing responses (album/photostream pages) are cached for `cache_listing_ttl_hours` (default **24h**, configurable in `config.json`); detail responses (`getSizes`, `getInfo`) for **30 days**.
+- `--refresh` bypasses the cache for one run without clearing it.
+- `--offline` serves only what's cached — no live requests at all — and fails clearly if nothing is cached yet for that call.
+- `flickrdownloader cache prune` removes expired entries (completion manifests are always kept, since they describe local files, not API freshness).
+- `flickrdownloader cache clear` removes everything cached for the current account.
+
+## Verify
+
+```bash
+flickrdownloader verify -u <flickr-user-url>
+```
+
+Checks each album's local files against its saved completion manifest — no downloading, and by default no Flickr requests at all (it trusts the manifest written by the last `download`/`watch` run). States shown per album:
+
+```
+  ✓ Wedding 2024                    412/412 photos, matches disk
+  ⚠ Summer Trip                     118/140 (22 missing)
+  · Road Trip                       not scanned — run with --refresh for a live check
+  ✗ Family Reunion                  3 local file(s) no longer match the current source
+
+  ✓ complete   ⚠ incomplete   · not scanned   ✗ stale/error
+```
+
+Add `--refresh` to re-list every album from Flickr instead of trusting the manifest — useful after manual edits to the output directory, or as a periodic integrity check.
+
+## Watch mode (continuous sync)
+
+```bash
+flickrdownloader watch --file ~/.config/flickrdownloader/watchlist.yaml
+```
+
+Turns `flickrdownloader` into a persistent watcher: it polls a **watchlist** of Flickr URLs on an interval, downloads anything new, and keeps running until you stop it (Ctrl-C / SIGTERM) — waiting through quota exhaustion or a Flickr-side rate limit instead of exiting.
+
+**Watchlist file** — YAML (`~/.config/flickrdownloader/watchlist.yaml` by default) for per-source overrides:
+
+```yaml
+poll_interval: 30m
+sources:
+  - url: https://www.flickr.com/photos/alice/
+    albums: all
+    uncategorized: true
+  - url: https://www.flickr.com/photos/bob/albums/72177720123456789
+    poll_interval: 1h
+```
+
+or a plain-text fallback (`sources.txt`, one URL per line, `#` comments allowed), which inherits `albums: all` and `uncategorized: true` for every entry:
+
+```text
+https://www.flickr.com/photos/alice/
+https://www.flickr.com/photos/bob/albums/72177720123456789
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--file` | auto-detect (`watchlist.yaml`, then `sources.txt`) | Watchlist path |
+| `--poll-interval` | from the file, or `30m` | Time between full cycles |
+| `--out` | config default | Output directory |
+| `--workers` | config default | Worker count |
+| `--log-file` | — | Append log lines to this file in addition to stdout |
+| `--quiet` | on automatically when not a terminal | Structured `key=value` log lines instead of the progress bar |
+
+A per-source error is logged and skipped — one bad URL never stops the daemon. `--quiet` output is one line per event, safe to `grep`/`awk`:
+
+```
+2026-08-17T12:00:00Z INFO watch starting watchlist=/home/user/.config/flickrdownloader/watchlist.yaml
+2026-08-17T12:00:04Z INFO source alice done in 4s
+```
+
+Example systemd/launchd service files that run `watch --quiet --log-file ...` are in [`docs/watch/`](docs/watch/).
 
 ## Updating
 
@@ -210,7 +290,7 @@ go vet ./...
 go test ./...
 
 # Build with a release version stamped in (used by --version and update)
-go build -ldflags "-X main.version=v1.1.0" -o flickrdownloader ./cmd/flickrdownloader
+go build -ldflags "-X main.version=v1.3.0" -o flickrdownloader ./cmd/flickrdownloader
 ```
 
 ## Robust downloads
@@ -224,10 +304,10 @@ After a **fully listed** per-album download, an ID-absent sweep removes stale `.
 ### Known limitations
 
 - If Flickr later serves the same photo under a **different extension**, an old `{id}.{old-ext}.part` is not automatically tied to the new final path and can be left behind until a qualifying album sweep (or manual cleanup).
-- **Concurrent CLI instances writing into the same output tree** are unsupported (candidate cleanup assumes one worker owns a photo ID per run). This is separate from the API quota, which *is* safely shared across concurrent runs — see [API quota](#api-quota).
+- **Concurrent `download`/`verify`/`watch` processes against the *same* output directory** are rejected outright by an advisory lock, rather than allowed to race — run them against separate output trees instead. Concurrent runs against *different* trees, and shared API quota tracking across runs, both work as expected.
 - Legacy `{id}.{ext}.tmp` files from older versions are **never resumed**; they are ignored by skip detection and left on disk.
 
-Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update decisions are in `ADR-015.md` … `ADR-018.md`).
+Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update: `ADR-015.md` … `ADR-018.md`; response cache, manifests, and watch mode: `ADR-019.md` … `ADR-023.md`).
 
 ## License
 

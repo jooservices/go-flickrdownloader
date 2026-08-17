@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for `flickrdownloader watch`.
+
+  Install:
+    mkdir -p ~/.local/state/flickrdownloader
+    cp com.jooservices.flickrdownloader.watch.plist ~/Library/LaunchAgents/
+    # edit the ProgramArguments path below if flickrdownloader isn't at
+    # /usr/local/bin/flickrdownloader (run `which flickrdownloader` to check)
+    launchctl load -w ~/Library/LaunchAgents/com.jooservices.flickrdownloader.watch.plist
+
+  Logs:
+    tail -f ~/.local/state/flickrdownloader/watch.log
+    tail -f ~/.local/state/flickrdownloader/watch.err.log
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.jooservices.flickrdownloader.watch.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.jooservices.flickrdownloader.watch</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/flickrdownloader</string>
+		<string>watch</string>
+		<string>--quiet</string>
+		<string>--log-file</string>
+		<string>/Users/USERNAME/.local/state/flickrdownloader/watch.log</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>/Users/USERNAME/.local/state/flickrdownloader/watch.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/USERNAME/.local/state/flickrdownloader/watch.err.log</string>
+</dict>
+</plist>

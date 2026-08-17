@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `flickrdownloader watch add <url> [more...]` — add Flickr URLs to the watchlist from the CLI instead of editing the file by hand; creates the file when missing, skips duplicates and non-Flickr URLs, and preserves existing global and per-source YAML options.
+- `flickrdownloader watch list` — print the URLs currently in the watchlist.
+- `flickrdownloader watch remove <url> [more...]` (alias `rm`) — drop URLs from the watchlist by exact match.
+- Watchlist edits are written atomically (temp file + rename), so a running `watch` daemon never observes a half-written file and picks up changes on its next cycle without a restart.
+
 ## [1.3.0] - 2026-08-17
 
 ### Added

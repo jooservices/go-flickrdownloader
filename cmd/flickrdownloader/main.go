@@ -132,6 +132,34 @@ func main() {
 	watchCmd.Flags().StringVar(&watchLogFile, "log-file", "", "Append watch's log lines to this file in addition to stdout")
 	watchCmd.Flags().BoolVar(&watchQuietFlag, "quiet", false, "Structured log lines instead of the progress bar (default: on automatically when stdout isn't a terminal)")
 
+	watchListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List the URLs in the watchlist",
+		RunE:  runWatchList,
+	}
+	watchListCmd.Flags().StringVar(&watchFile, "file", "", "Watchlist file (default: ~/.config/flickrdownloader/watchlist.yaml, then sources.txt)")
+
+	watchAddCmd := &cobra.Command{
+		Use:     "add <flickr-url> [more...]",
+		Short:   "Add Flickr URLs to the watchlist",
+		Args:    cobra.MinimumNArgs(1),
+		Example: "  flickrdownloader watch add https://www.flickr.com/photos/bob/",
+		RunE:    runWatchAdd,
+	}
+	watchAddCmd.Flags().StringVar(&watchFile, "file", "", "Watchlist file (default: ~/.config/flickrdownloader/watchlist.yaml, then sources.txt)")
+
+	watchRemoveCmd := &cobra.Command{
+		Use:     "remove <flickr-url> [more...]",
+		Aliases: []string{"rm"},
+		Short:   "Remove Flickr URLs from the watchlist",
+		Args:    cobra.MinimumNArgs(1),
+		Example: "  flickrdownloader watch remove https://www.flickr.com/photos/bob/",
+		RunE:    runWatchRemove,
+	}
+	watchRemoveCmd.Flags().StringVar(&watchFile, "file", "", "Watchlist file (default: ~/.config/flickrdownloader/watchlist.yaml, then sources.txt)")
+
+	watchCmd.AddCommand(watchListCmd, watchAddCmd, watchRemoveCmd)
+
 	cacheCmd := &cobra.Command{
 		Use:   "cache",
 		Short: "Manage the local Flickr response cache",
@@ -1129,23 +1157,34 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// resolveWatchlistPath returns the watchlist file to operate on, honoring
+// --file, then the first existing default, and finally the first default path
+// when allowMissing (used by `watch add`, which creates the file).
+func resolveWatchlistPath(allowMissing bool) (string, error) {
+	if watchFile != "" {
+		return watchFile, nil
+	}
+	defaults := watch.DefaultPaths()
+	for _, candidate := range defaults {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if allowMissing {
+		return defaults[0], nil
+	}
+	return "", fmt.Errorf("no watchlist found — create ~/.config/flickrdownloader/watchlist.yaml (or sources.txt), or pass --file")
+}
+
 func runWatch(cmd *cobra.Command, args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 
-	path := watchFile
-	if path == "" {
-		for _, candidate := range watch.DefaultPaths() {
-			if _, err := os.Stat(candidate); err == nil {
-				path = candidate
-				break
-			}
-		}
-		if path == "" {
-			return fmt.Errorf("no watchlist found — create ~/.config/flickrdownloader/watchlist.yaml (or sources.txt), or pass --file")
-		}
+	path, err := resolveWatchlistPath(false)
+	if err != nil {
+		return err
 	}
 
 	quiet := watchQuietFlag || !term.IsTerminal(int(os.Stdout.Fd()))
@@ -1237,6 +1276,63 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("watch: %w", err)
 	}
 	logf("watch stopped")
+	return nil
+}
+
+func runWatchList(cmd *cobra.Command, args []string) error {
+	path, err := resolveWatchlistPath(false)
+	if err != nil {
+		return err
+	}
+	urls, err := watch.ListSources(path)
+	if err != nil {
+		return fmt.Errorf("list watchlist: %w", err)
+	}
+	if len(urls) == 0 {
+		fmt.Printf("watchlist %s has no sources\n", path)
+		return nil
+	}
+	for _, u := range urls {
+		fmt.Println(u)
+	}
+	return nil
+}
+
+func runWatchAdd(cmd *cobra.Command, args []string) error {
+	path, err := resolveWatchlistPath(true)
+	if err != nil {
+		return err
+	}
+	added, err := watch.AddSources(path, args)
+	if err != nil {
+		return fmt.Errorf("add to watchlist: %w", err)
+	}
+	if len(added) == 0 {
+		fmt.Printf("no new URLs added to %s (all already present)\n", path)
+		return nil
+	}
+	for _, u := range added {
+		fmt.Printf("added %s\n", u)
+	}
+	return nil
+}
+
+func runWatchRemove(cmd *cobra.Command, args []string) error {
+	path, err := resolveWatchlistPath(false)
+	if err != nil {
+		return err
+	}
+	removed, err := watch.RemoveSources(path, args)
+	if err != nil {
+		return fmt.Errorf("remove from watchlist: %w", err)
+	}
+	if len(removed) == 0 {
+		fmt.Printf("no URLs removed from %s (none matched)\n", path)
+		return nil
+	}
+	for _, u := range removed {
+		fmt.Printf("removed %s\n", u)
+	}
 	return nil
 }
 

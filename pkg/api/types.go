@@ -3,7 +3,24 @@ package api
 import (
 	"encoding/json"
 	"strconv"
+	"time"
 )
+
+// PhotoMetadata is the normalized, cacheable record of one photo's download
+// URL and file characteristics (ADR-019/021). It lets an incomplete
+// photoset be repaired — or a verify pass check file integrity — without
+// re-reading the photoset's listing pages.
+type PhotoMetadata struct {
+	ID             string
+	URL            string
+	Media          string
+	OriginalFormat string
+	Extension      string
+	OWidth         int
+	OHeight        int
+	SizeBytes      int64
+	UpdatedAt      time.Time
+}
 
 type FlexInt int
 
@@ -110,7 +127,8 @@ type PhotoSetInfo struct {
 	Description struct {
 		Content string `json:"_content"`
 	} `json:"description"`
-	Photos FlexInt `json:"photos"`
+	Photos    FlexInt `json:"photos"`
+	UpdatedAt FlexInt `json:"date_update,omitempty"`
 }
 
 type PhotoSetsListResponse struct {

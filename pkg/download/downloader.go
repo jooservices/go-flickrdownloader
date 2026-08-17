@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,10 +18,15 @@ import (
 	"unicode/utf8"
 
 	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/flickrdownloader/pkg/cache"
 	"github.com/jooservices/flickrdownloader/pkg/ui"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 )
+
+// uncategorizedStatusID is the manifest key used for the "photos not in any
+// album" bucket, distinct from any real photoset ID.
+const uncategorizedStatusID = "__uncategorized__"
 
 type Stats struct {
 	Total   int64
@@ -41,11 +48,33 @@ type Downloader struct {
 	sleep      sleeper
 	jitter     func() float64
 
+	// rootDir is the output root as given to New, independent of OutDir
+	// (which is reassigned per-album during a run). It keys cache manifests
+	// (pkg/cache.PhotosetStatus.RootDir) and the output-root lock so they
+	// stay stable across the whole run.
+	rootDir string
+
+	// Cache is the optional response/manifest store (ADR-019/021). A nil
+	// Cache disables photoset completion manifests and verify's offline
+	// checks; downloads still work as before 1.3.0.
+	Cache *cache.Store
+
+	// Quiet disables the interactive progress ticker in favor of periodic
+	// structured summary lines, for non-TTY/service use (e.g. watch mode).
+	Quiet bool
+
 	// downloadedPaths records, per photo ID, the path of the first copy
 	// written to disk. Later albums reuse it via hardlinks instead of
 	// re-downloading the same file (feature: cross-album dedupe).
 	downloadedPaths map[string]string
 	pathMu          sync.Mutex
+
+	// localFiles indexes every photo ID already present anywhere under
+	// rootDir (populated by indexLocalFiles), enabling recursive local reuse
+	// across albums and users and the presence checks verify relies on
+	// (ADR-023).
+	localFiles   map[string]string
+	localFilesMu sync.Mutex
 
 	// Live status state for the progress renderer: the album currently being
 	// processed and the file currently being written by a worker.
@@ -83,12 +112,194 @@ func New(client *api.Client, outDir string, numWorkers int) *Downloader {
 	return &Downloader{
 		Client:          client,
 		OutDir:          outDir,
+		rootDir:         absolutePath(outDir),
 		NumWorkers:      numWorkers,
 		dlLimiter:       rate.NewLimiter(rate.Limit(numWorkers*2), numWorkers),
 		httpClient:      &http.Client{Timeout: 60 * time.Second},
 		jitter:          func() float64 { return 0.2 * rand.Float64() }, // +0-20% jitter (AC-001)
 		downloadedPaths: make(map[string]string),
 	}
+}
+
+// absolutePath returns an absolute form of path for stable identity
+// comparisons (manifest directories, stale-directory detection); it falls
+// back to path unchanged if resolution fails.
+func absolutePath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
+}
+
+// CanonicalPath resolves path to an absolute, symlink-resolved form, used to
+// identify the output root consistently across relative paths, symlinks, and
+// trailing slashes for the output-root lock (ADR-023).
+func CanonicalPath(path string) string {
+	abs := absolutePath(path)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
+}
+
+// WarmLocalIndex recursively indexes every already-downloaded photo under
+// the output root so later reuse/verification checks don't have to re-walk
+// the filesystem per album (ADR-023). Best-effort: an indexing error only
+// means reuse/verification degrade to their pre-1.3.0 behavior for this run,
+// so it's returned rather than treated as fatal by callers that choose to
+// ignore it.
+func (d *Downloader) WarmLocalIndex() error {
+	return d.indexLocalFiles(d.rootDir)
+}
+
+// indexLocalFiles walks dir recursively and records every file named
+// "<photoID>.<ext>" (skipping in-progress .part/.cand/.tmp artifacts), so
+// verification and cross-album/cross-user reuse can check local presence
+// without re-scanning per photoset.
+func (d *Downloader) indexLocalFiles(dir string) error {
+	d.localFilesMu.Lock()
+	defer d.localFilesMu.Unlock()
+	if d.localFiles == nil {
+		d.localFiles = make(map[string]string)
+	}
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if strings.HasSuffix(name, ".part") || strings.HasSuffix(name, ".cand") || strings.HasSuffix(name, ".tmp") {
+			return nil
+		}
+		id := strings.TrimSuffix(name, filepath.Ext(name))
+		if !api.ValidPhotoID(id) {
+			return nil
+		}
+		d.localFiles[id] = absolutePath(path)
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// missingPhotosetIDs returns the subset of expected not present as an
+// indexed local file inside dir (indexLocalFiles must have already run over
+// a tree containing dir).
+func (d *Downloader) missingPhotosetIDs(dir string, expected []string) []string {
+	d.localFilesMu.Lock()
+	defer d.localFilesMu.Unlock()
+	want := absolutePath(dir)
+	var missing []string
+	for _, id := range expected {
+		path, ok := d.localFiles[id]
+		if !ok || filepath.Dir(path) != want {
+			missing = append(missing, id)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// missingPhotosetManifestIDs is missingPhotosetIDs against a saved manifest's
+// own recorded directory, for the (!refresh) verification path.
+func (d *Downloader) missingPhotosetManifestIDs(status *cache.PhotosetStatus) []string {
+	return d.missingPhotosetIDs(status.Directory, status.ExpectedIDs)
+}
+
+// localPhotosetManifestComplete additionally checks file size against the
+// manifest's recorded size (when one was recorded), catching a truncated or
+// overwritten file that missingPhotosetManifestIDs' presence-only check
+// would miss.
+func (d *Downloader) localPhotosetManifestComplete(status *cache.PhotosetStatus) bool {
+	d.localFilesMu.Lock()
+	defer d.localFilesMu.Unlock()
+	for _, id := range status.ExpectedIDs {
+		path, ok := d.localFiles[id]
+		if !ok {
+			return false
+		}
+		if want, tracked := status.FileSizes[id]; tracked {
+			info, err := os.Stat(path)
+			if err != nil || info.Size() != want {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// loadPhotosetStatuses bulk-loads every manifest for rootDir+ownerNSID in one
+// query, avoiding a round trip per photoset. bulkLoaded is false (rather than
+// an error) when there's no cache configured, so callers fall back cleanly.
+func (d *Downloader) loadPhotosetStatuses(ctx context.Context, ownerNSID string) (statuses map[string]*cache.PhotosetStatus, bulkLoaded bool) {
+	if d.Cache == nil {
+		return nil, false
+	}
+	statuses, err := d.Cache.GetPhotosetStatuses(ctx, d.rootDir, ownerNSID)
+	if err != nil {
+		return nil, false
+	}
+	return statuses, true
+}
+
+// lookupPhotosetStatus resolves one manifest, preferring an already bulk
+// loaded map when available.
+func (d *Downloader) lookupPhotosetStatus(ctx context.Context, ownerNSID, photosetID string, statuses map[string]*cache.PhotosetStatus, bulkLoaded bool) *cache.PhotosetStatus {
+	if bulkLoaded {
+		return statuses[photosetID]
+	}
+	if d.Cache == nil {
+		return nil
+	}
+	status, err := d.Cache.GetPhotosetStatus(ctx, d.rootDir, ownerNSID, photosetID)
+	if err != nil {
+		return nil
+	}
+	return status
+}
+
+// savePhotosetStatus persists status; a write failure is reported but never
+// fatal since the manifest is an optimization, not the source of truth.
+func (d *Downloader) savePhotosetStatus(ctx context.Context, status cache.PhotosetStatus) {
+	if d.Cache == nil {
+		return
+	}
+	if err := d.Cache.PutPhotosetStatus(ctx, status); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s%s save manifest for %s: %v%s\n",
+			ui.ColorRed, ui.IconErr, status.Title, err, ui.ColorReset)
+	}
+}
+
+// collectPhotosetMembership pages through photosetID's full listing and
+// marks every photo ID as a member, used to keep deselected albums' photos
+// out of the "uncategorized" bucket during a refresh.
+func (d *Downloader) collectPhotosetMembership(ctx context.Context, photosetID string, membership map[string]bool) error {
+	first, err := d.Client.GetPhotosByPhotoset(ctx, photosetID, 1)
+	if err != nil {
+		return err
+	}
+	for _, p := range first.Photoset.Photo {
+		membership[p.ID] = true
+	}
+	pages := int(first.Photoset.Pages)
+	for page := 2; page <= pages; page++ {
+		resp, err := d.Client.GetPhotosByPhotoset(ctx, photosetID, page)
+		if err != nil {
+			return fmt.Errorf("photoset %s page %d: %w", photosetID, page, err)
+		}
+		for _, p := range resp.Photoset.Photo {
+			membership[p.ID] = true
+		}
+	}
+	return nil
 }
 
 // resolveDownloadURL avoids an extra flickr.photos.getSizes API call (which is
@@ -168,6 +379,16 @@ func fileExt(source string) string {
 func cleanExt(ext string) string {
 	if idx := strings.Index(ext, "?"); idx != -1 {
 		ext = ext[:idx]
+	}
+	// Defense-in-depth: ext becomes the tail of a filepath.Join'd path, so it
+	// must never carry a path separator or other filesystem-significant
+	// character even if a future response source is less trustworthy than
+	// today's Flickr CDN.
+	for i, r := range ext {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			ext = ext[:i]
+			break
+		}
 	}
 	switch ext {
 	case "jpeg":
@@ -291,12 +512,18 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 	}
 
 	// Cross-album dedupe: if this photo was already downloaded for another
-	// album, reuse it via a hardlink instead of downloading it again. On
+	// album (this run, or a prior run indexed via WarmLocalIndex — ADR-023),
+	// reuse it via a hardlink instead of downloading it again. On
 	// filesystems without hardlink support (e.g. some network mounts) we
 	// fall back to a regular download.
 	d.pathMu.Lock()
 	existing, ok := d.downloadedPaths[photo.ID]
 	d.pathMu.Unlock()
+	if !ok {
+		d.localFilesMu.Lock()
+		existing, ok = d.localFiles[photo.ID]
+		d.localFilesMu.Unlock()
+	}
 	if ok {
 		target := filepath.Join(d.OutDir, photo.ID+filepath.Ext(existing))
 		if err := os.Link(existing, target); err == nil {
@@ -374,6 +601,22 @@ func truncateRunes(s string, w int) string {
 // race the renderer's last in-flight tick.
 func (d *Downloader) startRenderer(ctx context.Context) (stop func()) {
 	done := make(chan struct{})
+	if d.Quiet {
+		go func() {
+			defer close(done)
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					d.logQuietProgress()
+				}
+			}
+		}()
+		return func() { <-done }
+	}
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(150 * time.Millisecond)
@@ -388,6 +631,21 @@ func (d *Downloader) startRenderer(ctx context.Context) (stop func()) {
 		}
 	}()
 	return func() { <-done }
+}
+
+// logQuietProgress emits one structured, greppable summary line in place of
+// the interactive progress bar, for non-TTY/service use (watch mode).
+func (d *Downloader) logQuietProgress() {
+	if d.progress == nil {
+		return
+	}
+	st := d.progress.Stats()
+	done := atomic.LoadInt64(&st.Success) + atomic.LoadInt64(&st.Skipped) +
+		atomic.LoadInt64(&st.Linked) + atomic.LoadInt64(&st.Failed)
+	fmt.Printf("%s INFO progress album=%q done=%d/%d ok=%d skip=%d link=%d fail=%d\n",
+		time.Now().UTC().Format(time.RFC3339), d.currentAlbum(), done, st.Total,
+		atomic.LoadInt64(&st.Success), atomic.LoadInt64(&st.Skipped),
+		atomic.LoadInt64(&st.Linked), atomic.LoadInt64(&st.Failed))
 }
 
 func (d *Downloader) downloadPhotosFromPages(
@@ -432,7 +690,13 @@ func (d *Downloader) downloadPhotosFromPages(
 		defer close(jobs)
 		for page := 1; page <= totalPages; page++ {
 			if page > 1 {
-				time.Sleep(100 * time.Millisecond)
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
 			}
 
 			select {
@@ -479,9 +743,11 @@ func (d *Downloader) downloadPhotosFromPages(
 		sweepStaleParts(d.OutDir, seenIDs)
 	}
 
-	fmt.Print("\r\033[K")
+	if !d.Quiet {
+		fmt.Print("\r\033[K")
+	}
 	stat := d.recordAlbum(d.currentAlbum(), d.progress)
-	if printCompletion {
+	if printCompletion && !d.Quiet {
 		fmt.Print(ui.CompletionLine(stat))
 	}
 
@@ -742,7 +1008,10 @@ func (d *Downloader) DownloadPhoto(ctx context.Context, photoID string) error {
 	}
 
 	d.worker(ctx, photo)
-	fmt.Print("\r\033[K")
-	fmt.Print(ui.CompletionLine(d.recordAlbum(d.currentAlbum(), d.progress)))
+	stat := d.recordAlbum(d.currentAlbum(), d.progress)
+	if !d.Quiet {
+		fmt.Print("\r\033[K")
+		fmt.Print(ui.CompletionLine(stat))
+	}
 	return nil
 }

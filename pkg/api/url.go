@@ -24,6 +24,9 @@ type ParsedURL struct {
 
 var photoIDRe = regexp.MustCompile(`^\d{8,}$`)
 
+// nsidRe matches Flickr's owner NSID shape: digits, "@N", two-or-more digits.
+var nsidRe = regexp.MustCompile(`^\d+@N\d{2,}$`)
+
 func ResolveURL(ctx context.Context, rawURL string, client *Client) (*ParsedURL, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {

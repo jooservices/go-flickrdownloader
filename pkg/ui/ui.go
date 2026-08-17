@@ -9,7 +9,9 @@ import (
 	"unicode/utf8"
 )
 
-const (
+// Color* are vars, not consts: colors.go's init() blanks them out when
+// output isn't a color-capable terminal (NO_COLOR, TERM=dumb, non-TTY).
+var (
 	ColorReset  = "\033[0m"
 	ColorBold   = "\033[1m"
 	ColorDim    = "\033[2m"
@@ -17,7 +19,9 @@ const (
 	ColorGreen  = "\033[32m"
 	ColorYellow = "\033[33m"
 	ColorCyan   = "\033[36m"
+)
 
+const (
 	IconOk    = "✓"
 	IconSkip  = "○"
 	IconLink  = "⇄"

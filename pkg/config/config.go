@@ -8,16 +8,21 @@ import (
 	"path/filepath"
 )
 
+// DefaultCacheListingTTLHours is how long cached photo/photoset listing
+// responses are considered fresh before a non-offline run re-fetches them.
+const DefaultCacheListingTTLHours = 24
+
 type Config struct {
-	APIKey         string `json:"api_key"`
-	APISecret      string `json:"api_secret"`
-	OAuthToken     string `json:"oauth_token"`
-	OAuthSecret    string `json:"oauth_token_secret"`
-	NSID           string `json:"nsid,omitempty"`
-	OutputDir      string `json:"output_dir,omitempty"`
-	WorkerCount    int    `json:"worker_count,omitempty"`
-	APIHourlyLimit int    `json:"api_hourly_limit,omitempty"`
-	APIRateMS      int    `json:"api_interval_ms,omitempty"`
+	APIKey               string `json:"api_key"`
+	APISecret            string `json:"api_secret"`
+	OAuthToken           string `json:"oauth_token"`
+	OAuthSecret          string `json:"oauth_token_secret"`
+	NSID                 string `json:"nsid,omitempty"`
+	OutputDir            string `json:"output_dir,omitempty"`
+	WorkerCount          int    `json:"worker_count,omitempty"`
+	APIHourlyLimit       int    `json:"api_hourly_limit,omitempty"`
+	APIRateMS            int    `json:"api_interval_ms,omitempty"`
+	CacheListingTTLHours int    `json:"cache_listing_ttl_hours,omitempty"`
 }
 
 func configDir() (string, error) {
@@ -68,6 +73,9 @@ func Load() (*Config, error) {
 	if cfg.APIRateMS <= 0 {
 		cfg.APIRateMS = 1050
 	}
+	if cfg.CacheListingTTLHours <= 0 {
+		cfg.CacheListingTTLHours = DefaultCacheListingTTLHours
+	}
 	return &cfg, nil
 }
 
@@ -80,6 +88,26 @@ func QuotaPath(apiKey string) (string, error) {
 	}
 	sum := sha256.Sum256([]byte(apiKey))
 	return filepath.Join(dir, fmt.Sprintf("quota-%x.log", sum[:4])), nil
+}
+
+// CachePath returns the per-account (API key + authenticated NSID) response
+// cache database path. Separate accounts get separate databases so cached
+// private listings can never leak across accounts sharing this machine.
+func CachePath(apiKey, nsid string) (string, error) {
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(apiKey + "|" + nsid))
+	return filepath.Join(dir, fmt.Sprintf("cache-%x.db", sum[:8])), nil
+}
+
+// AuthFingerprint derives a stable, non-reversible identifier for an OAuth
+// access token, used to detect re-authentication as a different account so
+// the response cache can be invalidated (see pkg/cache.Store.BindAuth).
+func AuthFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum)
 }
 
 func (c *Config) Save() error {

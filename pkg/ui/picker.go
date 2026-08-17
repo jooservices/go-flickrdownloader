@@ -148,7 +148,14 @@ func (p *picker) redraw() {
 		}
 	}
 
-	b.WriteString("\r\n  " + ColorDim + "↑/↓ move  space toggle  a all  n none  / filter  enter confirm  q cancel" + ColorReset)
+	selected := 0
+	for _, it := range p.items {
+		if it.Selected {
+			selected++
+		}
+	}
+	b.WriteString(fmt.Sprintf("\r\n  %s%d/%d selected%s  %s↑/↓ move  space toggle  a all  n none  / filter  enter confirm  q cancel%s",
+		ColorCyan, selected, len(p.items), ColorReset, ColorDim, ColorReset))
 	fmt.Print(b.String())
 }
 

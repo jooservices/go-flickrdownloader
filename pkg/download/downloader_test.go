@@ -333,12 +333,12 @@ func TestSweepPreservesEnqueuedIDArtifacts(t *testing.T) {
 	d.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(r.URL.Path, "active.jpg") {
 			return &http.Response{
-				StatusCode: 200,
-				Status:     "200 OK",
-				Header:     http.Header{"Content-Type": {"image/jpeg"}},
-				Body:       io.NopCloser(strings.NewReader("PHOTO")),
+				StatusCode:    200,
+				Status:        "200 OK",
+				Header:        http.Header{"Content-Type": {"image/jpeg"}},
+				Body:          io.NopCloser(strings.NewReader("PHOTO")),
 				ContentLength: 5,
-				Request:    r,
+				Request:       r,
 			}, nil
 		}
 		return &http.Response{

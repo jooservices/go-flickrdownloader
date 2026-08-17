@@ -4,19 +4,25 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/flickrdownloader/pkg/cache"
 	"github.com/jooservices/flickrdownloader/pkg/config"
 	"github.com/jooservices/flickrdownloader/pkg/download"
 	"github.com/jooservices/flickrdownloader/pkg/quota"
 	"github.com/jooservices/flickrdownloader/pkg/ui"
 	"github.com/jooservices/flickrdownloader/pkg/update"
+	"github.com/jooservices/flickrdownloader/pkg/watch"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -60,6 +66,17 @@ var (
 	albumsFlag      string
 	uncategorized   bool
 	updateCheckOnly bool
+	refreshFlag     bool
+	offlineFlag     bool
+
+	verifyRefreshFlag bool
+
+	watchFile         string
+	watchPollInterval time.Duration
+	watchOut          string
+	watchWorkersFlag  int
+	watchLogFile      string
+	watchQuietFlag    bool
 )
 
 func main() {
@@ -76,17 +93,60 @@ func main() {
 	}
 
 	downloadCmd := &cobra.Command{
-		Use:   "download -u <flickr-url>",
-		Short: "Download photos from a Flickr URL",
-		RunE:  runDownload,
+		Use:     "download -u <flickr-url>",
+		Short:   "Download photos from a Flickr URL",
+		PreRunE: func(cmd *cobra.Command, args []string) error { return rejectRefreshOffline(refreshFlag, offlineFlag) },
+		RunE:    runDownload,
 	}
 	downloadCmd.Flags().StringVarP(&urlFlag, "url", "u", "", "Flickr URL (user / album / photo)")
-	downloadCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory (default: ./photos)")
+	downloadCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory (default: from config, normally ./photos)")
 	downloadCmd.Flags().IntVarP(&workers, "workers", "w", 0, "Number of concurrent download workers (default: 20)")
 	downloadCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview what would be downloaded (album tree, counts, estimated size) without downloading")
 	downloadCmd.Flags().BoolVarP(&yesFlag, "yes", "y", false, "Skip the confirmation prompt and the album picker (download everything)")
 	downloadCmd.Flags().StringVar(&albumsFlag, "albums", "", "Only download matching albums (comma-separated names, 'all' or 'none')")
 	downloadCmd.Flags().BoolVar(&uncategorized, "uncategorized", true, "Include photos that are not in any album")
+	downloadCmd.Flags().BoolVar(&refreshFlag, "refresh", false, "Bypass cached metadata and completion manifests, re-check everything against Flickr")
+	downloadCmd.Flags().BoolVar(&offlineFlag, "offline", false, "Use cached Flickr responses only; never make a live request")
+
+	verifyCmd := &cobra.Command{
+		Use:     "verify -u <flickr-url>",
+		Short:   "Check downloaded photos against local completion manifests without downloading",
+		PreRunE: func(cmd *cobra.Command, args []string) error { return rejectRefreshOffline(verifyRefreshFlag, false) },
+		RunE:    runVerify,
+	}
+	verifyCmd.Flags().StringVarP(&urlFlag, "url", "u", "", "Flickr URL (user)")
+	verifyCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory (default: from config, normally ./photos)")
+	verifyCmd.Flags().BoolVar(&verifyRefreshFlag, "refresh", false, "Re-check the current Flickr listing instead of trusting cached manifests")
+
+	watchCmd := &cobra.Command{
+		Use:   "watch",
+		Short: "Continuously poll a watchlist and download new photos, forever",
+		Long: "Poll a watchlist file of Flickr URLs on an interval, downloading anything new and waiting\n" +
+			"through quota exhaustion instead of exiting. Runs until interrupted (Ctrl-C / SIGTERM).",
+		RunE: runWatch,
+	}
+	watchCmd.Flags().StringVar(&watchFile, "file", "", "Watchlist file (default: ~/.config/flickrdownloader/watchlist.yaml, then sources.txt)")
+	watchCmd.Flags().DurationVar(&watchPollInterval, "poll-interval", 0, "Time between full cycles (default: from the watchlist file, or 30m)")
+	watchCmd.Flags().StringVar(&watchOut, "out", "", "Output directory (default: from config, normally ./photos)")
+	watchCmd.Flags().IntVar(&watchWorkersFlag, "workers", 0, "Worker count (default: from config)")
+	watchCmd.Flags().StringVar(&watchLogFile, "log-file", "", "Append watch's log lines to this file in addition to stdout")
+	watchCmd.Flags().BoolVar(&watchQuietFlag, "quiet", false, "Structured log lines instead of the progress bar (default: on automatically when stdout isn't a terminal)")
+
+	cacheCmd := &cobra.Command{
+		Use:   "cache",
+		Short: "Manage the local Flickr response cache",
+	}
+	cachePruneCmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Remove expired cache entries (photoset completion manifests are kept)",
+		RunE:  runCachePrune,
+	}
+	cacheClearCmd := &cobra.Command{
+		Use:   "clear",
+		Short: "Remove all cached responses, metadata, and completion manifests for this account",
+		RunE:  runCacheClear,
+	}
+	cacheCmd.AddCommand(cachePruneCmd, cacheClearCmd)
 
 	updateCmd := &cobra.Command{
 		Use:   "update",
@@ -124,6 +184,9 @@ func main() {
 
 	rootCmd.AddCommand(authCmd)
 	rootCmd.AddCommand(downloadCmd)
+	rootCmd.AddCommand(verifyCmd)
+	rootCmd.AddCommand(watchCmd)
+	rootCmd.AddCommand(cacheCmd)
 	rootCmd.AddCommand(updateCmd)
 	rootCmd.AddCommand(quotaCmd)
 	rootCmd.AddCommand(completionCmd)
@@ -131,6 +194,110 @@ func main() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// rejectRefreshOffline rejects the contradictory combination of forcing a
+// live check (--refresh) and forbidding one (--offline) before either flag
+// reaches the client, instead of leaving the outcome to whichever cache
+// check happens to run first.
+func rejectRefreshOffline(refresh, offline bool) error {
+	if refresh && offline {
+		return fmt.Errorf("--refresh and --offline can't be used together\n" +
+			"  --refresh forces a live check against Flickr.\n" +
+			"  --offline forbids any live request.\n" +
+			"  Pick one.")
+	}
+	return nil
+}
+
+// setupSignalContext returns a context cancelled on SIGINT/SIGTERM and a
+// stop func callers must defer to release the signal handler — without it,
+// the goroutine below (and the OS-level signal registration) outlives the
+// command that started it.
+func setupSignalContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigCh:
+			fmt.Printf("\n  %s%s Cancelling — waiting for in-flight downloads to finish...%s\n",
+				ui.ColorYellow, ui.IconErr, ui.ColorReset)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(sigCh)
+		cancel()
+	}
+}
+
+// lockOutputRoot acquires an advisory flock on rootDir so at most one
+// flickrdownloader process (download/verify/watch) operates on it at a time,
+// preventing two concurrent runs from racing manifest writes or partial
+// downloads (ADR-023).
+func lockOutputRoot(rootDir string) (func() error, error) {
+	if err := os.MkdirAll(rootDir, 0755); err != nil {
+		return nil, fmt.Errorf("create output directory: %w", err)
+	}
+	fl := flock.New(filepath.Join(rootDir, ".flickrdownloader.lock"))
+	locked, err := fl.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("lock output directory: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("output directory %s is already in use by another flickrdownloader process", rootDir)
+	}
+	return fl.Unlock, nil
+}
+
+// newQuotaTracker builds the persisted per-API-key quota tracker from cfg.
+func newQuotaTracker(cfg *config.Config) (*quota.Tracker, error) {
+	qPath, err := config.QuotaPath(cfg.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	tr, err := quota.New(qPath, cfg.APIHourlyLimit, time.Duration(cfg.APIRateMS)*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("init quota tracker: %w", err)
+	}
+	return tr, nil
+}
+
+func flushQuotaOnExit(tr *quota.Tracker) func() {
+	return func() {
+		if err := tr.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s%s flush quota log: %v%s\n", ui.ColorRed, ui.IconErr, err, ui.ColorReset)
+		}
+	}
+}
+
+// newClientWithCache builds an API client wired to the persisted quota
+// tracker and, when available, the account-scoped response cache (ADR-019).
+// The cache is an optimization only: if it can't be opened (e.g. read-only
+// filesystem), the run continues without one rather than failing.
+func newClientWithCache(cfg *config.Config, tr *quota.Tracker, refresh, offline bool) (*api.Client, *cache.Store, error) {
+	client := api.NewClient(cfg.APIKey, cfg.APISecret, cfg.OAuthToken, cfg.OAuthSecret)
+	client.SetRateLimiter(tr)
+
+	cachePath, err := config.CachePath(cfg.APIKey, cfg.NSID)
+	if err != nil {
+		return client, nil, fmt.Errorf("resolve cache path: %w", err)
+	}
+	store, err := cache.Open(cachePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  %s%s response cache unavailable, continuing without it: %v%s\n",
+			ui.ColorYellow, ui.IconErr, err, ui.ColorReset)
+		return client, nil, nil
+	}
+	if err := store.BindAuth(context.Background(), config.AuthFingerprint(cfg.OAuthToken)); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s%s bind cache to account: %v%s\n", ui.ColorYellow, ui.IconErr, err, ui.ColorReset)
+	}
+	client.SetResponseCache(store)
+	client.SetCacheListingTTL(time.Duration(cfg.CacheListingTTLHours) * time.Hour)
+	client.SetCachePolicy(refresh, offline)
+	return client, store, nil
 }
 
 func runUpdate(cmd *cobra.Command, args []string) error {
@@ -224,15 +391,16 @@ func runAuth(cmd *cobra.Command, args []string) error {
 	}
 
 	cfg := &config.Config{
-		APIKey:         apiKey,
-		APISecret:      apiSecret,
-		OAuthToken:     accessToken,
-		OAuthSecret:    accessSecret,
-		NSID:           userNSID,
-		WorkerCount:    20,
-		OutputDir:      "./photos",
-		APIHourlyLimit: quota.DefaultHourlyLimit,
-		APIRateMS:      int(quota.DefaultInterval / time.Millisecond),
+		APIKey:               apiKey,
+		APISecret:            apiSecret,
+		OAuthToken:           accessToken,
+		OAuthSecret:          accessSecret,
+		NSID:                 userNSID,
+		WorkerCount:          20,
+		OutputDir:            "./photos",
+		APIHourlyLimit:       quota.DefaultHourlyLimit,
+		APIRateMS:            int(quota.DefaultInterval / time.Millisecond),
+		CacheListingTTLHours: config.DefaultCacheListingTTLHours,
 	}
 
 	if err := cfg.Save(); err != nil {
@@ -240,7 +408,10 @@ func runAuth(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\n  %s%s Authenticated as %s (NSID: %s)%s\n", ui.ColorGreen, ui.IconOk, username, userNSID, ui.ColorReset)
-	fmt.Printf("  %sConfig saved. You can now use '%s'%s\n", ui.ColorDim, "flickrdownloader download -u <url>", ui.ColorReset)
+	fmt.Printf("  %sConfig saved.%s\n\n", ui.ColorDim, ui.ColorReset)
+	fmt.Printf("  Next steps:\n")
+	fmt.Printf("    %-42s %sone-time download%s\n", "flickrdownloader download -u <url>", ui.ColorDim, ui.ColorReset)
+	fmt.Printf("    %-42s %sauto-download forever%s\n", "flickrdownloader watch --file <path>", ui.ColorDim, ui.ColorReset)
 	return nil
 }
 
@@ -252,21 +423,6 @@ func confirm(prompt string) bool {
 		return false
 	}
 	return line == "" || strings.EqualFold(line, "y") || strings.EqualFold(line, "yes")
-}
-
-// matchSets maps a --albums spec ("all", "none", or comma-separated names,
-// exact or substring, case-insensitive) onto the fetched album list.
-// newQuotaTracker builds the persisted per-API-key quota tracker from cfg.
-func newQuotaTracker(cfg *config.Config) (*quota.Tracker, error) {
-	qPath, err := config.QuotaPath(cfg.APIKey)
-	if err != nil {
-		return nil, err
-	}
-	tr, err := quota.New(qPath, cfg.APIHourlyLimit, time.Duration(cfg.APIRateMS)*time.Millisecond)
-	if err != nil {
-		return nil, fmt.Errorf("init quota tracker: %w", err)
-	}
-	return tr, nil
 }
 
 func runQuota(cmd *cobra.Command, args []string) error {
@@ -304,9 +460,12 @@ func runQuota(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %sRolls:%s     oldest request expires in %s%s%s\n",
 			ui.ColorDim, ui.ColorReset, col, ui.FormatDuration(wait), ui.ColorReset)
 	}
+	fmt.Printf("\n  %s● green <80%%   ● yellow 80–99%%   ● red at cap, requests pause%s\n", ui.ColorDim, ui.ColorReset)
 	return nil
 }
 
+// matchSets maps a --albums spec ("all", "none", or comma-separated names,
+// exact or substring, case-insensitive) onto the fetched album list.
 func matchSets(sets []api.PhotoSetInfo, spec string) ([]api.PhotoSetInfo, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -345,6 +504,11 @@ func matchSets(sets []api.PhotoSetInfo, spec string) ([]api.PhotoSetInfo, error)
 			}
 		}
 		if !found {
+			suggestions := closestAlbumNames(names, name, 3)
+			if len(suggestions) > 0 {
+				return nil, fmt.Errorf("no album matches '%s'\n\n  Did you mean:\n    %s\n\n  Run with --dry-run to see the full album list.",
+					name, strings.Join(suggestions, "\n    "))
+			}
 			return nil, fmt.Errorf("no album matches '%s' — available albums:\n    %s",
 				name, strings.Join(names, "\n    "))
 		}
@@ -352,60 +516,81 @@ func matchSets(sets []api.PhotoSetInfo, spec string) ([]api.PhotoSetInfo, error)
 	return out, nil
 }
 
-func runDownload(cmd *cobra.Command, args []string) error {
-	if urlFlag == "" {
-		return fmt.Errorf("provide -u <flickr-url>")
+// closestAlbumNames returns up to n names ranked by edit distance to query,
+// used to suggest a fix for a typo'd --albums name instead of dumping the
+// full album list.
+func closestAlbumNames(names []string, query string, n int) []string {
+	type scored struct {
+		name string
+		dist int
 	}
+	q := strings.ToLower(query)
+	scores := make([]scored, 0, len(names))
+	for _, name := range names {
+		scores = append(scores, scored{name, levenshtein(strings.ToLower(name), q)})
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i].dist < scores[j].dist })
+	out := make([]string, 0, n)
+	for i := 0; i < len(scores) && i < n; i++ {
+		out = append(out, scores[i].name)
+	}
+	return out
+}
 
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+func levenshtein(a, b string) int {
+	la, lb := len(a), len(b)
+	d := make([]int, lb+1)
+	for j := range d {
+		d[j] = j
 	}
-
-	if workers > 0 {
-		cfg.WorkerCount = workers
-	}
-	if outDir != "" {
-		cfg.OutputDir = outDir
-	}
-
-	tr, err := newQuotaTracker(cfg)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tr.Flush(); err != nil {
-			fmt.Fprintf(os.Stderr, "  %s%s flush quota log: %v%s\n",
-				ui.ColorRed, ui.IconErr, err, ui.ColorReset)
+	for i := 1; i <= la; i++ {
+		prev := d[0]
+		d[0] = i
+		for j := 1; j <= lb; j++ {
+			temp := d[j]
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			d[j] = minInt(d[j]+1, minInt(d[j-1]+1, prev+cost))
+			prev = temp
 		}
-	}()
+	}
+	return d[lb]
+}
 
-	client := api.NewClient(cfg.APIKey, cfg.APISecret, cfg.OAuthToken, cfg.OAuthSecret)
-	client.SetRateLimiter(tr)
+func minInt(a, b int) int {
+	if b < a {
+		return b
+	}
+	return a
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// downloadOnceOptions controls one download pass, shared by the `download`
+// command's single run and each `watch` cycle's per-source run.
+type downloadOnceOptions struct {
+	Albums        string // "" triggers the interactive picker when eligible; otherwise a matchSets spec
+	Uncategorized bool
+	DryRun        bool
+	Yes           bool // skip the picker/confirmation (always true for watch)
+	Quiet         bool // suppress interactive/TTY-only output (always true for watch's default)
+}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Printf("\n  %s%s Cancelling...%s\n", ui.ColorYellow, ui.IconErr, ui.ColorReset)
-		cancel()
-	}()
+// runDownloadOnce resolves urlStr and downloads it, sharing the resolve +
+// dispatch + report logic between the `download` command and every watch
+// cycle's per-source run instead of duplicating it.
+func runDownloadOnce(ctx context.Context, urlStr string, cfg *config.Config, client *api.Client, dl *download.Downloader, opts downloadOnceOptions) error {
+	dl.Quiet = opts.Quiet
 
-	fmt.Printf("\n%s\n\n", ui.Bordered("Flickr Downloader", ui.ColorCyan))
-	fmt.Printf("  %sResolving URL...%s\n", ui.ColorDim, ui.ColorReset)
-	parsed, err := api.ResolveURL(ctx, urlFlag, client)
+	parsed, err := api.ResolveURL(ctx, urlStr, client)
 	if err != nil {
-		return fmt.Errorf("resolve URL '%s': %w", urlFlag, err)
+		return fmt.Errorf("resolve URL '%s': %w", urlStr, err)
 	}
 
-	fmt.Printf("\n  %sURL:%s    %s\n", ui.ColorDim, ui.ColorReset, urlFlag)
-
-	printQuotaHeader(client)
-
-	dl := download.New(client, cfg.OutputDir, cfg.WorkerCount)
+	if !opts.Quiet {
+		fmt.Printf("\n  %sURL:%s    %s\n", ui.ColorDim, ui.ColorReset, urlStr)
+		printQuotaHeader(client)
+	}
 
 	var runErr error
 	switch parsed.Type {
@@ -414,17 +599,19 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("get photo info: %w", err)
 		}
-		fmt.Printf("  %sType:%s   Photo\n", ui.ColorDim, ui.ColorReset)
-		fmt.Printf("  %sTitle:%s  %s\n", ui.ColorDim, ui.ColorReset, info.Photo.Title.Content)
-		fmt.Printf("  %sOwner:%s  %s (%s)\n", ui.ColorDim, ui.ColorReset, info.Photo.Owner.Username, info.Photo.Owner.NSID)
-		fmt.Printf("  %sMedia:%s  %s\n", ui.ColorDim, ui.ColorReset, info.Photo.Media)
-		fmt.Printf("  %sOutput:%s %s/%s/\n\n", ui.ColorDim, ui.ColorReset, cfg.OutputDir, info.Photo.Owner.NSID)
-
-		if dryRun {
-			fmt.Printf("  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
+		if !opts.Quiet {
+			fmt.Printf("  %sType:%s   Photo\n", ui.ColorDim, ui.ColorReset)
+			fmt.Printf("  %sTitle:%s  %s\n", ui.ColorDim, ui.ColorReset, info.Photo.Title.Content)
+			fmt.Printf("  %sOwner:%s  %s (%s)\n", ui.ColorDim, ui.ColorReset, info.Photo.Owner.Username, info.Photo.Owner.NSID)
+			fmt.Printf("  %sMedia:%s  %s\n", ui.ColorDim, ui.ColorReset, info.Photo.Media)
+			fmt.Printf("  %sOutput:%s %s/%s/\n\n", ui.ColorDim, ui.ColorReset, dl.OutDir, info.Photo.Owner.NSID)
+		}
+		if opts.DryRun {
+			if !opts.Quiet {
+				fmt.Printf("  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
+			}
 			return nil
 		}
-
 		runErr = dl.DownloadPhoto(ctx, parsed.ID)
 
 	case api.TargetPhotoset:
@@ -432,27 +619,32 @@ func runDownload(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("get photoset info: %w", err)
 		}
-		fmt.Printf("  %sType:%s   Album\n", ui.ColorDim, ui.ColorReset)
-		fmt.Printf("  %sTitle:%s  %s\n", ui.ColorDim, ui.ColorReset, psInfo.Title.Content)
-		fmt.Printf("  %sOwner:%s  %s\n", ui.ColorDim, ui.ColorReset, psInfo.Owner)
-		fmt.Printf("  %sPhotos:%s %d\n", ui.ColorDim, ui.ColorReset, int(psInfo.Photos))
-		fmt.Printf("  %sOutput:%s %s/%s/%s/\n\n", ui.ColorDim, ui.ColorReset, cfg.OutputDir, psInfo.Owner, download.SafeName(psInfo.Title.Content))
-
-		if dryRun {
-			fmt.Printf("  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
+		if !opts.Quiet {
+			fmt.Printf("  %sType:%s   Album\n", ui.ColorDim, ui.ColorReset)
+			fmt.Printf("  %sTitle:%s  %s\n", ui.ColorDim, ui.ColorReset, psInfo.Title.Content)
+			fmt.Printf("  %sOwner:%s  %s\n", ui.ColorDim, ui.ColorReset, psInfo.Owner)
+			fmt.Printf("  %sPhotos:%s %d\n", ui.ColorDim, ui.ColorReset, int(psInfo.Photos))
+			fmt.Printf("  %sOutput:%s %s/%s/%s/\n\n", ui.ColorDim, ui.ColorReset, dl.OutDir, psInfo.Owner, download.SafeName(psInfo.Title.Content))
+		}
+		if opts.DryRun {
+			if !opts.Quiet {
+				fmt.Printf("  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
+			}
 			return nil
 		}
-
-		fmt.Printf("  %sDownloading...%s\n", ui.ColorDim, ui.ColorReset)
+		if !opts.Quiet {
+			fmt.Printf("  %sDownloading...%s\n", ui.ColorDim, ui.ColorReset)
+		}
 		_, runErr = dl.DownloadByPhotoset(ctx, parsed.ID)
 
 	case api.TargetUser:
-		runErr = runUserDownload(ctx, dl, client, parsed.ID)
+		runErr = runUserDownload(ctx, dl, client, parsed.ID, cfg, opts)
 	}
 
-	// Per-album breakdown table, then the API cost of the run.
-	fmt.Print(ui.Breakdown(dl.AlbumStats()))
-	printRunSummary(client)
+	if !opts.Quiet {
+		fmt.Print(ui.Breakdown(dl.AlbumStats()))
+		printRunSummary(client)
+	}
 	return runErr
 }
 
@@ -486,15 +678,19 @@ func printRunSummary(client *api.Client) {
 		line += fmt.Sprintf(" · %d/%d used this hour (%d left)",
 			used, limit, max(limit-used, 0))
 	}
+	if hits := client.CacheHits(); hits > 0 {
+		line += fmt.Sprintf(" · %d served from cache", hits)
+	}
 	fmt.Println(line)
 }
 
-func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.Client, nsid string) error {
-	fmt.Printf("  %sType:%s   User\n", ui.ColorDim, ui.ColorReset)
-	fmt.Printf("  %sNSID:%s   %s\n", ui.ColorDim, ui.ColorReset, nsid)
-	fmt.Printf("  %sOutput:%s %s/%s/\n", ui.ColorDim, ui.ColorReset, dl.OutDir, nsid)
-
-	fmt.Printf("\n  %sScanning photos & albums...%s\n", ui.ColorDim, ui.ColorReset)
+func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.Client, nsid string, cfg *config.Config, opts downloadOnceOptions) error {
+	if !opts.Quiet {
+		fmt.Printf("  %sType:%s   User\n", ui.ColorDim, ui.ColorReset)
+		fmt.Printf("  %sNSID:%s   %s\n", ui.ColorDim, ui.ColorReset, nsid)
+		fmt.Printf("  %sOutput:%s %s/%s/\n", ui.ColorDim, ui.ColorReset, dl.OutDir, nsid)
+		fmt.Printf("\n  %sScanning photos & albums...%s\n", ui.ColorDim, ui.ColorReset)
+	}
 	sets, err := client.GetPhotosets(ctx, nsid)
 	if err != nil {
 		return fmt.Errorf("discover photosets: %w", err)
@@ -508,17 +704,17 @@ func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.C
 
 	// Decide which albums to download.
 	var selected []api.PhotoSetInfo
-	includeOrphans := uncategorized
+	includeOrphans := opts.Uncategorized
 	showSelections := false
 
 	switch {
-	case albumsFlag != "":
-		selected, err = matchSets(sets, albumsFlag)
+	case opts.Albums != "":
+		selected, err = matchSets(sets, opts.Albums)
 		if err != nil {
 			return err
 		}
 		showSelections = true
-	case term.IsTerminal(int(os.Stdin.Fd())) && !dryRun && !yesFlag:
+	case !opts.Quiet && !opts.Yes && !opts.DryRun && term.IsTerminal(int(os.Stdin.Fd())):
 		items := buildPickerItems(sets, firstPage, totalPhotos)
 		picked, err := ui.PickMulti("Select albums to download", items)
 		if err != nil {
@@ -544,21 +740,27 @@ func runUserDownload(ctx context.Context, dl *download.Downloader, client *api.C
 	}
 
 	// Show the plan: album tree with selections and estimated sizes.
-	printPlan(client, sets, selected, includeOrphans, firstPage, totalPhotos, showSelections)
+	if !opts.Quiet {
+		printPlan(client, sets, selected, includeOrphans, firstPage, totalPhotos, showSelections, cfg.APIRateMS)
+	}
 
-	if dryRun {
-		fmt.Printf("\n  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
+	if opts.DryRun {
+		if !opts.Quiet {
+			fmt.Printf("\n  %s%s Dry run — nothing downloaded.%s\n", ui.ColorYellow, ui.IconSpark, ui.ColorReset)
+		}
 		return nil
 	}
 
-	if !yesFlag && term.IsTerminal(int(os.Stdin.Fd())) {
+	if !opts.Yes && !opts.Quiet && term.IsTerminal(int(os.Stdin.Fd())) {
 		if !confirm("Start download?") {
 			fmt.Printf("  %sCancelled — nothing downloaded.%s\n", ui.ColorYellow, ui.ColorReset)
 			return nil
 		}
 	}
 
-	fmt.Printf("\n  %sDownloading albums...%s\n", ui.ColorDim, ui.ColorReset)
+	if !opts.Quiet {
+		fmt.Printf("\n  %sDownloading albums...%s\n", ui.ColorDim, ui.ColorReset)
+	}
 	_, err = dl.DownloadByUser(ctx, nsid, download.UserDownloadOptions{
 		Sets:           selected,
 		FirstPage:      firstPage,
@@ -609,7 +811,7 @@ func buildPickerItems(sets []api.PhotoSetInfo, firstPage *api.PhotosResponse, to
 	return items
 }
 
-func printPlan(client *api.Client, sets, selected []api.PhotoSetInfo, includeOrphans bool, firstPage *api.PhotosResponse, totalPhotos int, showSelections bool) {
+func printPlan(client *api.Client, sets, selected []api.PhotoSetInfo, includeOrphans bool, firstPage *api.PhotosResponse, totalPhotos int, showSelections bool, paceMS int) {
 	avg := download.AvgPhotoBytes(firstPage.Photos.Photo)
 	selectedByID := map[string]bool{}
 	for _, s := range selected {
@@ -673,7 +875,7 @@ func printPlan(client *api.Client, sets, selected []api.PhotoSetInfo, includeOrp
 		total += fmt.Sprintf(" · ~%s estimated", ui.FormatBytes(extrapolated))
 	}
 	fmt.Printf("\n  %sTotal:%s %s\n", ui.ColorBold, ui.ColorReset, total)
-	printAPIEstimate(client, selected, includeOrphans, totalPhotos, firstPage)
+	printAPIEstimate(client, selected, includeOrphans, totalPhotos, firstPage, paceMS)
 }
 
 // estimateAPICalls predicts the REST requests still needed to list and
@@ -714,9 +916,11 @@ func estimateAPICalls(selected []api.PhotoSetInfo, includeOrphans bool, totalPho
 }
 
 // printAPIEstimate shows the predicted API cost of the plan against the
-// remaining hourly budget, plus a wall-clock estimate at the interval pace
-// (including pauses at the cap when the plan exceeds the budget).
-func printAPIEstimate(client *api.Client, selected []api.PhotoSetInfo, includeOrphans bool, totalPhotos int, firstPage *api.PhotosResponse) {
+// remaining hourly budget, plus a wall-clock estimate at paceMS (the
+// configured interval limiter — passed in rather than hardcoded, so this
+// estimate can't silently drift from the actual pace when APIRateMS is
+// non-default), including pauses at the cap when the plan exceeds the budget.
+func printAPIEstimate(client *api.Client, selected []api.PhotoSetInfo, includeOrphans bool, totalPhotos int, firstPage *api.PhotosResponse, paceMS int) {
 	used, limit, _ := client.Quota()
 	if limit <= 0 {
 		return
@@ -734,7 +938,7 @@ func printAPIEstimate(client *api.Client, selected []api.PhotoSetInfo, includeOr
 		status = "✓ fits within the hourly quota"
 	}
 
-	pace := 1050.0 // ms per request (the interval limiter)
+	pace := float64(paceMS) // ms per request — matches the interval limiter
 	wall := time.Duration(float64(total) * pace * float64(time.Millisecond))
 	if total > remaining {
 		pauses := (total - remaining + limit - 1) / limit
@@ -749,4 +953,343 @@ func printAPIEstimate(client *api.Client, selected []api.PhotoSetInfo, includeOr
 		fmt.Printf("  %sEst. wall time:%s %s\n",
 			ui.ColorBold, ui.ColorReset, ui.FormatDuration(wall))
 	}
+}
+
+func runDownload(cmd *cobra.Command, args []string) error {
+	if urlFlag == "" {
+		return fmt.Errorf("provide -u <flickr-url>")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	if workers > 0 {
+		cfg.WorkerCount = workers
+	}
+	if outDir != "" {
+		cfg.OutputDir = outDir
+	}
+
+	tr, err := newQuotaTracker(cfg)
+	if err != nil {
+		return err
+	}
+	defer flushQuotaOnExit(tr)()
+
+	client, store, err := newClientWithCache(cfg, tr, refreshFlag, offlineFlag)
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		defer store.Close()
+	}
+
+	unlock, err := lockOutputRoot(cfg.OutputDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	ctx, stop := setupSignalContext()
+	defer stop()
+
+	fmt.Printf("\n%s\n\n", ui.Bordered("Flickr Downloader", ui.ColorCyan))
+	fmt.Printf("  %sResolving URL...%s\n", ui.ColorDim, ui.ColorReset)
+
+	dl := download.New(client, cfg.OutputDir, cfg.WorkerCount)
+	dl.Cache = store
+	if err := dl.WarmLocalIndex(); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s%s index local files: %v%s\n", ui.ColorYellow, ui.IconErr, err, ui.ColorReset)
+	}
+
+	return runDownloadOnce(ctx, urlFlag, cfg, client, dl, downloadOnceOptions{
+		Albums:        albumsFlag,
+		Uncategorized: uncategorized,
+		DryRun:        dryRun,
+		Yes:           yesFlag,
+		Quiet:         false,
+	})
+}
+
+func verificationSymbol(state download.VerificationState) (color, symbol string) {
+	switch state {
+	case download.VerificationComplete:
+		return ui.ColorGreen, "✓"
+	case download.VerificationIncomplete:
+		return ui.ColorYellow, "⚠"
+	case download.VerificationStale, download.VerificationError:
+		return ui.ColorRed, "✗"
+	default: // not-scanned
+		return ui.ColorDim, "·"
+	}
+}
+
+func printVerificationReport(report *download.VerificationReport) {
+	fmt.Printf("\n%s\n\n", ui.Bordered("Verify", ui.ColorCyan))
+
+	all := append([]download.PhotosetVerification{}, report.Photosets...)
+	if report.Uncategorized != nil {
+		all = append(all, *report.Uncategorized)
+	}
+	for _, v := range all {
+		col, sym := verificationSymbol(v.State)
+		var detail string
+		switch v.State {
+		case download.VerificationComplete:
+			detail = fmt.Sprintf("%d/%d photos, matches disk", v.Present, v.Expected)
+		case download.VerificationIncomplete:
+			detail = fmt.Sprintf("%d/%d (%d missing)", v.Present, v.Expected, len(v.Missing))
+		case download.VerificationNotScanned:
+			detail = "not scanned — run with --refresh for a live check"
+		case download.VerificationStale:
+			detail = fmt.Sprintf("%d local file(s) no longer match the current source", len(v.Missing))
+		case download.VerificationError:
+			detail = v.Error
+		}
+		fmt.Printf("  %s%s%s %-32s %s%s%s\n", col, sym, ui.ColorReset, v.Title, ui.ColorDim, detail, ui.ColorReset)
+	}
+
+	if len(report.StaleDirectories) > 0 {
+		fmt.Printf("\n  %sStale directories (not in the current album list):%s\n", ui.ColorYellow, ui.ColorReset)
+		for _, d := range report.StaleDirectories {
+			fmt.Printf("    %s%s%s\n", ui.ColorDim, d, ui.ColorReset)
+		}
+	}
+
+	fmt.Printf("\n  %s%s%s complete   %s%s%s incomplete   %s· not scanned   %s%s%s stale/error%s\n",
+		ui.ColorGreen, "✓", ui.ColorReset,
+		ui.ColorYellow, "⚠", ui.ColorReset,
+		ui.ColorDim,
+		ui.ColorRed, "✗", ui.ColorReset, ui.ColorReset)
+}
+
+func runVerify(cmd *cobra.Command, args []string) error {
+	if urlFlag == "" {
+		return fmt.Errorf("provide -u <flickr-url>")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if outDir != "" {
+		cfg.OutputDir = outDir
+	}
+
+	tr, err := newQuotaTracker(cfg)
+	if err != nil {
+		return err
+	}
+	defer flushQuotaOnExit(tr)()
+
+	client, store, err := newClientWithCache(cfg, tr, false, false)
+	if err != nil {
+		return err
+	}
+	if store == nil {
+		return fmt.Errorf("verify requires the response cache to be available — check that ~/.config/flickrdownloader is writable")
+	}
+	defer store.Close()
+
+	unlock, err := lockOutputRoot(cfg.OutputDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	ctx, stop := setupSignalContext()
+	defer stop()
+
+	parsed, err := api.ResolveURL(ctx, urlFlag, client)
+	if err != nil {
+		return fmt.Errorf("resolve URL '%s': %w", urlFlag, err)
+	}
+	if parsed.Type != api.TargetUser {
+		return fmt.Errorf("verify currently supports user URLs only")
+	}
+
+	dl := download.New(client, cfg.OutputDir, cfg.WorkerCount)
+	dl.Cache = store
+
+	sets, err := client.GetPhotosets(ctx, parsed.ID)
+	if err != nil {
+		return fmt.Errorf("list photosets: %w", err)
+	}
+
+	report, err := dl.VerifyUser(ctx, parsed.ID, sets, verifyRefreshFlag, download.VerifyUserOpts{
+		AuthenticatedNSID: cfg.NSID,
+	})
+	if err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+
+	printVerificationReport(report)
+	return nil
+}
+
+func runWatch(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	path := watchFile
+	if path == "" {
+		for _, candidate := range watch.DefaultPaths() {
+			if _, err := os.Stat(candidate); err == nil {
+				path = candidate
+				break
+			}
+		}
+		if path == "" {
+			return fmt.Errorf("no watchlist found — create ~/.config/flickrdownloader/watchlist.yaml (or sources.txt), or pass --file")
+		}
+	}
+
+	quiet := watchQuietFlag || !term.IsTerminal(int(os.Stdout.Fd()))
+
+	writers := []io.Writer{os.Stdout}
+	if watchLogFile != "" {
+		f, err := os.OpenFile(watchLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("open log file: %w", err)
+		}
+		defer f.Close()
+		writers = append(writers, f)
+	}
+	logf := func(format string, args ...any) {
+		line := fmt.Sprintf("%s INFO %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, args...))
+		for _, w := range writers {
+			fmt.Fprint(w, line)
+		}
+	}
+
+	outDirDefault := cfg.OutputDir
+	if watchOut != "" {
+		outDirDefault = watchOut
+	}
+	workerDefault := cfg.WorkerCount
+	if watchWorkersFlag > 0 {
+		workerDefault = watchWorkersFlag
+	}
+
+	unlock, err := lockOutputRoot(outDirDefault)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	tr, err := newQuotaTracker(cfg)
+	if err != nil {
+		return err
+	}
+	defer flushQuotaOnExit(tr)()
+
+	client, store, err := newClientWithCache(cfg, tr, false, false)
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		defer store.Close()
+	}
+
+	ctx, stop := setupSignalContext()
+	defer stop()
+
+	sched := &watch.Scheduler{
+		Path:         path,
+		PollInterval: watchPollInterval,
+		Logf:         logf,
+		RunSource: func(ctx context.Context, src watch.Source) error {
+			srcOut := outDirDefault
+			if src.OutputDir != "" {
+				srcOut = src.OutputDir
+			}
+			srcWorkers := workerDefault
+			if src.Workers > 0 {
+				srcWorkers = src.Workers
+			}
+
+			dl := download.New(client, srcOut, srcWorkers)
+			dl.Cache = store
+			if err := dl.WarmLocalIndex(); err != nil {
+				logf("source=%s status=index_warning err=%q", src.URL, err.Error())
+			}
+
+			albums := src.Albums
+			if albums == "" {
+				albums = "all"
+			}
+
+			return runDownloadOnce(ctx, src.URL, cfg, client, dl, downloadOnceOptions{
+				Albums:        albums,
+				Uncategorized: src.IncludeOrphans,
+				Yes:           true,
+				Quiet:         quiet,
+			})
+		},
+	}
+
+	logf("watch starting watchlist=%s", path)
+	if err := sched.Loop(ctx); err != nil {
+		return fmt.Errorf("watch: %w", err)
+	}
+	logf("watch stopped")
+	return nil
+}
+
+func pluralIES(n int64) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
+}
+
+func runCachePrune(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	path, err := config.CachePath(cfg.APIKey, cfg.NSID)
+	if err != nil {
+		return err
+	}
+	store, err := cache.Open(path)
+	if err != nil {
+		return fmt.Errorf("open cache: %w", err)
+	}
+	defer store.Close()
+
+	listingTTL := time.Duration(cfg.CacheListingTTLHours) * time.Hour
+	removed, err := store.Prune(context.Background(), time.Now(), listingTTL, api.DefaultDetailTTL)
+	if err != nil {
+		return fmt.Errorf("prune cache: %w", err)
+	}
+	fmt.Printf("  %s%s Pruned %d expired cache entr%s%s\n", ui.ColorGreen, ui.IconOk, removed, pluralIES(removed), ui.ColorReset)
+	return nil
+}
+
+func runCacheClear(cmd *cobra.Command, args []string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	path, err := config.CachePath(cfg.APIKey, cfg.NSID)
+	if err != nil {
+		return err
+	}
+	store, err := cache.Open(path)
+	if err != nil {
+		return fmt.Errorf("open cache: %w", err)
+	}
+	defer store.Close()
+
+	removed, err := store.Clear(context.Background())
+	if err != nil {
+		return fmt.Errorf("clear cache: %w", err)
+	}
+	fmt.Printf("  %s%s Cleared %d cache entr%s%s\n", ui.ColorGreen, ui.IconOk, removed, pluralIES(removed), ui.ColorReset)
+	return nil
 }

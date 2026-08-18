@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -59,9 +60,17 @@ type Downloader struct {
 	// checks; downloads still work as before 1.3.0.
 	Cache *cache.Store
 
+	// Refresh bypasses completion-manifest reuse for this run so every
+	// album is re-listed from Flickr (CLI --refresh / --force).
+	Refresh bool
+
 	// Quiet disables the interactive progress ticker in favor of periodic
 	// structured summary lines, for non-TTY/service use (e.g. watch mode).
 	Quiet bool
+
+	// Logf, when set, receives quiet-mode progress lines (watch --log-file).
+	// The function is expected to add its own timestamp/prefix.
+	Logf func(format string, args ...any)
 
 	// downloadedPaths records, per photo ID, the path of the first copy
 	// written to disk. Later albums reuse it via hardlinks instead of
@@ -72,8 +81,9 @@ type Downloader struct {
 	// localFiles indexes every photo ID already present anywhere under
 	// rootDir (populated by indexLocalFiles), enabling recursive local reuse
 	// across albums and users and the presence checks verify relies on
-	// (ADR-023).
+	// (ADR-023). The first path seen for an ID is kept as the hardlink source.
 	localFiles   map[string]string
+	localByDir   map[string]map[string]string // abs directory → photo ID → path
 	localFilesMu sync.Mutex
 
 	// Live status state for the progress renderer: the album currently being
@@ -87,16 +97,38 @@ type Downloader struct {
 	statsMu    sync.Mutex
 }
 
-var safeNameRe = regexp.MustCompile(`[<>:"/\\|?*]`)
+var (
+	safeNameRe    = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
+	winReservedRe = regexp.MustCompile(`(?i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$`)
+	allowedExt    = map[string]string{
+		"jpg": "jpg", "jpeg": "jpg", "png": "png", "gif": "gif", "webp": "webp",
+		"tif": "tif", "tiff": "tiff", "bmp": "bmp",
+		"mp4": "mp4", "mov": "mov", "m4v": "m4v", "avi": "avi",
+		"mkv": "mkv", "webm": "webm", "3gp": "3gp", "ogv": "ogv",
+	}
+)
 
+const safeNameMaxRunes = 120
+
+// SafeName turns a Flickr title into a directory name that is valid on
+// Windows and Unix: strips reserved characters, trailing dots/spaces,
+// Windows device names (CON, NUL, …), and truncates on a rune boundary.
 func SafeName(name string) string {
 	name = strings.TrimSpace(name)
 	name = safeNameRe.ReplaceAllString(name, "_")
+	name = strings.TrimRight(name, " .")
 	if name == "" || name == "." || name == ".." {
 		return "untitled"
 	}
-	if len(name) > 120 {
-		name = name[:120]
+	if winReservedRe.MatchString(name) {
+		name += "_"
+	}
+	if utf8.RuneCountInString(name) > safeNameMaxRunes {
+		name = string([]rune(name)[:safeNameMaxRunes])
+		name = strings.TrimRight(name, " .")
+		if name == "" {
+			return "untitled"
+		}
 	}
 	return name
 }
@@ -115,7 +147,7 @@ func New(client *api.Client, outDir string, numWorkers int) *Downloader {
 		rootDir:         absolutePath(outDir),
 		NumWorkers:      numWorkers,
 		dlLimiter:       rate.NewLimiter(rate.Limit(numWorkers*2), numWorkers),
-		httpClient:      &http.Client{Timeout: 60 * time.Second},
+		httpClient:      newDownloadHTTPClient(),
 		jitter:          func() float64 { return 0.2 * rand.Float64() }, // +0-20% jitter (AC-001)
 		downloadedPaths: make(map[string]string),
 	}
@@ -150,6 +182,10 @@ func CanonicalPath(path string) string {
 // so it's returned rather than treated as fatal by callers that choose to
 // ignore it.
 func (d *Downloader) WarmLocalIndex() error {
+	d.localFilesMu.Lock()
+	d.localFiles = make(map[string]string)
+	d.localByDir = make(map[string]map[string]string)
+	d.localFilesMu.Unlock()
 	return d.indexLocalFiles(d.rootDir)
 }
 
@@ -162,6 +198,9 @@ func (d *Downloader) indexLocalFiles(dir string) error {
 	defer d.localFilesMu.Unlock()
 	if d.localFiles == nil {
 		d.localFiles = make(map[string]string)
+	}
+	if d.localByDir == nil {
+		d.localByDir = make(map[string]map[string]string)
 	}
 	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -181,7 +220,15 @@ func (d *Downloader) indexLocalFiles(dir string) error {
 		if !api.ValidPhotoID(id) {
 			return nil
 		}
-		d.localFiles[id] = absolutePath(path)
+		abs := absolutePath(path)
+		parent := filepath.Dir(abs)
+		if d.localByDir[parent] == nil {
+			d.localByDir[parent] = make(map[string]string)
+		}
+		d.localByDir[parent][id] = abs
+		if _, exists := d.localFiles[id]; !exists {
+			d.localFiles[id] = abs
+		}
 		return nil
 	})
 	if err != nil && !os.IsNotExist(err) {
@@ -197,8 +244,12 @@ func (d *Downloader) missingPhotosetIDs(dir string, expected []string) []string 
 	d.localFilesMu.Lock()
 	defer d.localFilesMu.Unlock()
 	want := absolutePath(dir)
+	inDir := d.localByDir[want]
 	var missing []string
 	for _, id := range expected {
+		if _, ok := inDir[id]; ok {
+			continue
+		}
 		path, ok := d.localFiles[id]
 		if !ok || filepath.Dir(path) != want {
 			missing = append(missing, id)
@@ -221,10 +272,15 @@ func (d *Downloader) missingPhotosetManifestIDs(status *cache.PhotosetStatus) []
 func (d *Downloader) localPhotosetManifestComplete(status *cache.PhotosetStatus) bool {
 	d.localFilesMu.Lock()
 	defer d.localFilesMu.Unlock()
+	wantDir := absolutePath(status.Directory)
+	inDir := d.localByDir[wantDir]
 	for _, id := range status.ExpectedIDs {
-		path, ok := d.localFiles[id]
+		path, ok := inDir[id]
 		if !ok {
-			return false
+			path, ok = d.localFiles[id]
+			if !ok || filepath.Dir(path) != wantDir {
+				return false
+			}
 		}
 		if want, tracked := status.FileSizes[id]; tracked {
 			info, err := os.Stat(path)
@@ -309,7 +365,7 @@ func (d *Downloader) collectPhotosetMembership(ctx context.Context, photosetID s
 // url_o (e.g. the owner disabled original-size downloads).
 func (d *Downloader) resolveDownloadURL(ctx context.Context, photo api.Photo) (string, string, error) {
 	if photo.Media != "video" && photo.URLOriginal != "" {
-		return photo.URLOriginal, cleanExt(fileExt(photo.URLOriginal)), nil
+		return acceptDownloadURL(photo.URLOriginal)
 	}
 	return d.fetchSizesAndEnrich(ctx, photo)
 }
@@ -362,10 +418,7 @@ func (d *Downloader) fetchSizesAndEnrich(ctx context.Context, photo api.Photo) (
 		return "", "", fmt.Errorf("no sizes available for photo %s", photo.ID)
 	}
 
-	ext := fileExt(downloadURL)
-	ext = cleanExt(ext)
-
-	return downloadURL, ext, nil
+	return acceptDownloadURL(downloadURL)
 }
 
 func fileExt(source string) string {
@@ -374,6 +427,27 @@ func fileExt(source string) string {
 		return "jpg"
 	}
 	return strings.ToLower(source[idx+1:])
+}
+
+func acceptDownloadURL(raw string) (string, string, error) {
+	if !allowedDownloadURL(raw) {
+		return "", "", fmt.Errorf("refusing download from non-Flickr host")
+	}
+	return raw, cleanExt(fileExt(raw)), nil
+}
+
+func allowedDownloadURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return allowedDownloadHost(u.Hostname())
+}
+
+func allowedDownloadHost(host string) bool {
+	host = strings.ToLower(strings.TrimPrefix(host, "www."))
+	return host == "flickr.com" || strings.HasSuffix(host, ".flickr.com") ||
+		host == "staticflickr.com" || strings.HasSuffix(host, ".staticflickr.com")
 }
 
 func cleanExt(ext string) string {
@@ -390,13 +464,31 @@ func cleanExt(ext string) string {
 			break
 		}
 	}
-	switch ext {
-	case "jpeg":
-		return "jpg"
-	case "":
-		return "jpg"
-	default:
-		return ext
+	ext = strings.ToLower(ext)
+	if mapped, ok := allowedExt[ext]; ok {
+		return mapped
+	}
+	return "jpg"
+}
+
+// newDownloadHTTPClient keeps the 60s per-attempt Timeout required by
+// ADR-005 / AC-003, adds a header timeout so a hung CDN does not burn the
+// whole minute before retry, and refuses redirects off Flickr's CDN.
+func newDownloadHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{
+		Timeout:   60 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if !allowedDownloadHost(req.URL.Hostname()) {
+				return fmt.Errorf("refusing redirect to non-Flickr host %s", req.URL.Host)
+			}
+			return nil
+		},
 	}
 }
 
@@ -439,6 +531,18 @@ func (d *Downloader) downloadFile(ctx context.Context, url, filePath string) (in
 // extension in OutDir (ignoring incomplete download artifacts), so resuming
 // works regardless of the file's actual media type.
 func (d *Downloader) alreadyDownloaded(photoID string) bool {
+	wantDir := absolutePath(d.OutDir)
+	d.localFilesMu.Lock()
+	inDir := d.localByDir[wantDir]
+	if inDir != nil {
+		_, ok := inDir[photoID]
+		d.localFilesMu.Unlock()
+		if ok {
+			return true
+		}
+	} else {
+		d.localFilesMu.Unlock()
+	}
 	matches, _ := filepath.Glob(filepath.Join(d.OutDir, photoID+".*"))
 	for _, m := range matches {
 		if !strings.HasSuffix(m, ".part") &&
@@ -642,10 +746,15 @@ func (d *Downloader) logQuietProgress() {
 	st := d.progress.Stats()
 	done := atomic.LoadInt64(&st.Success) + atomic.LoadInt64(&st.Skipped) +
 		atomic.LoadInt64(&st.Linked) + atomic.LoadInt64(&st.Failed)
-	fmt.Printf("%s INFO progress album=%q done=%d/%d ok=%d skip=%d link=%d fail=%d\n",
-		time.Now().UTC().Format(time.RFC3339), d.currentAlbum(), done, st.Total,
+	msg := fmt.Sprintf("progress album=%q done=%d/%d ok=%d skip=%d link=%d fail=%d",
+		d.currentAlbum(), done, st.Total,
 		atomic.LoadInt64(&st.Success), atomic.LoadInt64(&st.Skipped),
 		atomic.LoadInt64(&st.Linked), atomic.LoadInt64(&st.Failed))
+	if d.Logf != nil {
+		d.Logf("%s", msg)
+		return
+	}
+	fmt.Printf("%s INFO %s\n", time.Now().UTC().Format(time.RFC3339), msg)
 }
 
 func (d *Downloader) downloadPhotosFromPages(
@@ -824,9 +933,23 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 		fmt.Printf("  %sFound %d photoset(s)%s\n", ui.ColorCyan, len(sets), ui.ColorReset)
 	}
 
+	statuses, bulkLoaded := map[string]*cache.PhotosetStatus(nil), false
+	if !d.Refresh {
+		statuses, bulkLoaded = d.loadPhotosetStatuses(ctx, userID)
+	}
+
 	for _, set := range sets {
 		setName := SafeName(set.Title.Content)
 		setDir := filepath.Join(userDir, setName)
+
+		if !d.Refresh {
+			status := d.lookupPhotosetStatusForDir(ctx, userID, set.ID, setDir, statuses, bulkLoaded)
+			if d.photosetListingReusable(status, set, setDir) {
+				d.skipCompletedPhotoset(setName, status, downloaded)
+				totalSkipped += int64(len(status.ExpectedIDs))
+				continue
+			}
+		}
 
 		if err := os.MkdirAll(setDir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "  %s%s create dir %s: %v%s\n",
@@ -849,6 +972,8 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 			ui.ColorCyan, ui.IconPhoto, setName, ui.ColorDim, total, ui.ColorReset)
 		d.setAlbum(setName)
 
+		var listedIDs []string
+		listingOK := true
 		stats := d.downloadPhotosFromPages(ctx, total, pages, true, false,
 			func(ctx context.Context, page int) ([]api.Photo, error) {
 				var photos []api.Photo
@@ -857,15 +982,21 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 				} else {
 					resp, err := d.Client.GetPhotosByPhotoset(ctx, set.ID, page)
 					if err != nil {
+						listingOK = false
 						return nil, err
 					}
 					photos = resp.Photoset.Photo
 				}
 				for _, p := range photos {
 					downloaded[p.ID] = true
+					listedIDs = append(listedIDs, p.ID)
 				}
 				return photos, nil
 			})
+
+		if listingOK && stats.Failed == 0 && ctx.Err() == nil && len(listedIDs) == total {
+			d.saveCompletePhotoset(ctx, userID, set.ID, setName, setDir, listedIDs, int64(set.UpdatedAt))
+		}
 
 		totalSuccess += stats.Success
 		totalSkipped += stats.Skipped
@@ -874,16 +1005,15 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 	}
 
 	// Download remaining photos not in any photoset
+	includeOrphans := opts.IncludeOrphans || opts.Sets == nil
 	firstPage := opts.FirstPage
-	if firstPage == nil {
+	if firstPage == nil && includeOrphans {
 		fp, err := d.Client.GetPhotosByUser(ctx, userID, 1)
 		if err != nil {
 			return Stats{}, fmt.Errorf("get first page: %w", err)
 		}
 		firstPage = fp
 	}
-
-	includeOrphans := opts.IncludeOrphans || opts.Sets == nil
 
 	orphans := 0
 	var orphanPhotos []api.Photo
@@ -933,8 +1063,12 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 	fmt.Printf("\n  %s%s Total: %d photosets + %d uncategorized%s\n",
 		ui.ColorGreen, ui.IconSpark, len(sets), orphans, ui.ColorReset)
 
+	totalPhotos := int64(0)
+	if firstPage != nil {
+		totalPhotos = int64(int(firstPage.Photos.Total))
+	}
 	return Stats{
-		Total:   int64(int(firstPage.Photos.Total)),
+		Total:   totalPhotos,
 		Success: totalSuccess,
 		Skipped: totalSkipped,
 		Linked:  totalLinked,
@@ -943,20 +1077,32 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 }
 
 func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) (Stats, error) {
+	info, infoErr := d.Client.GetPhotosetInfo(ctx, photosetID)
+	ownerNSID := ""
+	setName := photosetID
+	if infoErr == nil {
+		ownerNSID = info.Owner
+		setName = SafeName(info.Title.Content)
+		setDir := filepath.Join(d.OutDir, ownerNSID, setName)
+		if !d.Refresh && ownerNSID != "" {
+			_ = d.indexLocalFiles(filepath.Join(d.rootDir, ownerNSID))
+			status := d.lookupPhotosetStatus(ctx, ownerNSID, photosetID, nil, false)
+			if d.photosetListingReusable(status, *info, setDir) {
+				d.skipCompletedPhotoset(setName, status, map[string]bool{})
+				return Stats{Total: int64(len(status.ExpectedIDs)), Skipped: int64(len(status.ExpectedIDs))}, nil
+			}
+		}
+	}
+
 	firstPage, err := d.Client.GetPhotosByPhotoset(ctx, photosetID, 1)
 	if err != nil {
 		return Stats{}, fmt.Errorf("get first page: %w", err)
 	}
-
-	// Owner NSID always comes from the photoset listing itself, so the output
-	// directory layout stays consistent even if the title lookup below fails.
-	ownerNSID := firstPage.Photoset.Owner
-	setName := photosetID
-	if info, err := d.Client.GetPhotosetInfo(ctx, photosetID); err == nil {
-		setName = SafeName(info.Title.Content)
+	if ownerNSID == "" {
+		ownerNSID = firstPage.Photoset.Owner
 	}
-
 	setDir := filepath.Join(d.OutDir, ownerNSID, setName)
+
 	if err := os.MkdirAll(setDir, 0755); err != nil {
 		return Stats{}, fmt.Errorf("create output dir: %w", err)
 	}
@@ -967,17 +1113,34 @@ func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) 
 	total := int(firstPage.Photoset.Total)
 	pages := int(firstPage.Photoset.Pages)
 
+	var listedIDs []string
+	listingOK := true
 	stats := d.downloadPhotosFromPages(ctx, total, pages, true, true,
 		func(ctx context.Context, page int) ([]api.Photo, error) {
+			var photos []api.Photo
 			if page == 1 {
-				return firstPage.Photoset.Photo, nil
+				photos = firstPage.Photoset.Photo
+			} else {
+				resp, err := d.Client.GetPhotosByPhotoset(ctx, photosetID, page)
+				if err != nil {
+					listingOK = false
+					return nil, err
+				}
+				photos = resp.Photoset.Photo
 			}
-			resp, err := d.Client.GetPhotosByPhotoset(ctx, photosetID, page)
-			if err != nil {
-				return nil, err
+			for _, p := range photos {
+				listedIDs = append(listedIDs, p.ID)
 			}
-			return resp.Photoset.Photo, nil
+			return photos, nil
 		})
+
+	if listingOK && stats.Failed == 0 && ctx.Err() == nil && len(listedIDs) == total {
+		updatedAt := int64(0)
+		if info != nil {
+			updatedAt = int64(info.UpdatedAt)
+		}
+		d.saveCompletePhotoset(ctx, ownerNSID, photosetID, setName, setDir, listedIDs, updatedAt)
+	}
 
 	return stats, nil
 }

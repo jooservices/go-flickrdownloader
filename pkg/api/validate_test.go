@@ -26,3 +26,16 @@ func TestValidatePhotosRejectsBadID(t *testing.T) {
 		t.Fatal("expected validation error")
 	}
 }
+
+func TestValidatePhotoInfoRejectsBadOwner(t *testing.T) {
+	var resp PhotoInfoResponse
+	resp.Photo.ID = "12345678"
+	resp.Photo.Owner.NSID = "../evil"
+	if err := validatePhotoInfo(resp); err == nil {
+		t.Fatal("expected invalid owner nsid to fail")
+	}
+	resp.Photo.Owner.NSID = "123456789@N01"
+	if err := validatePhotoInfo(resp); err != nil {
+		t.Fatalf("valid photo info rejected: %v", err)
+	}
+}

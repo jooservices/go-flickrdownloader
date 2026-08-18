@@ -49,3 +49,13 @@ func validatePhotoSets(sets []PhotoSetInfo) error {
 	}
 	return nil
 }
+
+func validatePhotoInfo(resp PhotoInfoResponse) error {
+	if !ValidPhotoID(resp.Photo.ID) {
+		return fmt.Errorf("invalid photo id %q", resp.Photo.ID)
+	}
+	if resp.Photo.Owner.NSID != "" && !ValidNSID(resp.Photo.Owner.NSID) {
+		return fmt.Errorf("invalid owner nsid %q for photo %s", resp.Photo.Owner.NSID, resp.Photo.ID)
+	}
+	return nil
+}

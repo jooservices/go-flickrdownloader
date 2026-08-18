@@ -2,12 +2,37 @@
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-17
+
 ### Added
 
+- `flickrdownloader scan -u <url>` — walk the output tree and write photoset completion manifests (binds folders via `photosets.getList`; `--offline` is disk-only).
+- `download` skips per-album listing when a completion manifest still matches disk (same Flickr `date_update`, same files and sizes). `--force` is an alias for `--refresh` and re-lists everything.
 - `flickrdownloader watch add <url> [more...]` — add Flickr URLs to the watchlist from the CLI instead of editing the file by hand; creates the file when missing, skips duplicates and non-Flickr URLs, and preserves existing global and per-source YAML options.
 - `flickrdownloader watch list` — print the URLs currently in the watchlist.
 - `flickrdownloader watch remove <url> [more...]` (alias `rm`) — drop URLs from the watchlist by exact match.
 - Watchlist edits are written atomically (temp file + rename), so a running `watch` daemon never observes a half-written file and picks up changes on its next cycle without a restart.
+
+### Fixed
+
+- Quota-log compaction on Windows no longer fails with `Access is denied` on every API request. The log handle is closed before the temp-file replace, a failed compact is logged once and retried after 5 minutes (instead of tearing the progress bar at ~1 Hz), and the replace retries transient locks then falls back to remove+rename.
+- `SafeName` no longer splits multi-byte titles, and rejects Windows reserved device names (`CON`, `NUL`, …) plus trailing dots/spaces.
+- `verify --refresh` now records per-file sizes on manifests, so a later `download` skip-listing pass still detects truncated files.
+- `watch` locks each source's `OutputDir`, not only the default root.
+- `LookupUser` / `GetPhotoInfo` (and photoset listing owners) reject malformed NSIDs before they become folder names.
+- `config.Save` writes atomically (same temp+rename as the watchlist) so a crash cannot truncate OAuth tokens.
+- Download URLs are restricted to Flickr CDN hosts and a fixed extension allowlist; hung CDN headers time out in 30s (the 60s body timeout from ADR-005 is unchanged).
+- `alreadyDownloaded` consults the local index before falling back to `Glob`.
+- SQLite WAL/SHM sidecars are chmod'd `0600` like the cache database.
+- Windows self-update warns if `flickrdownloader.exe.old` cannot be removed.
+- `watch --log-file` receives quiet progress lines and warns once if a write fails.
+- Windows consoles enable virtual terminal processing so ANSI colors work outside Windows Terminal.
+
+### Tests
+
+- New/updated: `pkg/quota` (compact rewrite, backoff, single warning, Windows-safe replace), `pkg/download` (SafeName reserved names/runes, index-first skip, CDN host/ext allowlist, manifest file sizes), `pkg/api` (photo-info NSID validation), `pkg/config` (atomic save), `pkg/cache` (WAL/SHM 0600).
+- `go build ./...`, `go vet ./...`, `gofmt -l .` clean.
+- `go test ./...` and `go test -race` on the touched packages pass; `GOOS=windows` cross-build of the CLI is clean.
 
 ## [1.3.0] - 2026-08-17
 

@@ -8,6 +8,7 @@ import (
 )
 
 func init() {
+	enableVirtualTerminal()
 	if !colorsEnabled() {
 		disableColors()
 	}

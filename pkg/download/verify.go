@@ -111,6 +111,7 @@ func (d *Downloader) VerifyUser(ctx context.Context, userID string, sets []api.P
 					RootDir: d.rootDir, OwnerNSID: userID, PhotosetID: set.ID,
 					Title: setName, Directory: absoluteSetDir, ExpectedIDs: expected,
 					Complete: verification.State == VerificationComplete, SourceUpdatedAt: int64(set.UpdatedAt),
+					FileSizes: d.fileSizesInDir(setDir),
 				})
 			}
 		} else if status == nil {
@@ -190,7 +191,8 @@ func (d *Downloader) VerifyUser(ctx context.Context, userID string, sets []api.P
 				d.savePhotosetStatus(ctx, cache.PhotosetStatus{
 					RootDir: d.rootDir, OwnerNSID: userID, PhotosetID: uncategorizedStatusID,
 					Title: verification.Title, Directory: verification.Directory, ExpectedIDs: expected,
-					Complete: verification.State == VerificationComplete,
+					Complete:  verification.State == VerificationComplete,
+					FileSizes: d.fileSizesInDir(userDir),
 				})
 			}
 		}

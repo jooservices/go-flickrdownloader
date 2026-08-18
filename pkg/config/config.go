@@ -119,8 +119,36 @@ func (c *Config) Save() error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := WriteFileAtomic(path, data, 0600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
+}
+
+// WriteFileAtomic writes data to a temp file in the same directory and
+// renames it over path so a crash mid-write cannot leave a truncated file
+// (OAuth tokens live here).
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }

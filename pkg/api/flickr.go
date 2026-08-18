@@ -370,6 +370,9 @@ func (c *Client) GetPhotosByPhotoset(ctx context.Context, photosetID string, pag
 	if err := validatePhotos(resp.Photoset.Photo); err != nil {
 		return nil, fmt.Errorf("photoset %s page %d: %w", photosetID, page, err)
 	}
+	if resp.Photoset.Owner != "" && !ValidNSID(resp.Photoset.Owner) {
+		return nil, fmt.Errorf("photoset %s: invalid owner nsid %q", photosetID, resp.Photoset.Owner)
+	}
 
 	return &resp, nil
 }
@@ -497,6 +500,9 @@ func (c *Client) LookupUser(ctx context.Context, flickrURL string) (string, erro
 	if resp.Stat != "ok" {
 		return "", fmt.Errorf("%w — raw: %s", flickrErr(resp.Code, resp.Message), string(data))
 	}
+	if !ValidNSID(resp.User.ID) {
+		return "", fmt.Errorf("lookupUser: invalid nsid %q", resp.User.ID)
+	}
 	return resp.User.ID, nil
 }
 
@@ -514,6 +520,9 @@ func (c *Client) GetPhotoInfo(ctx context.Context, photoID string) (*PhotoInfoRe
 	}
 	if resp.Stat != "ok" {
 		return nil, flickrErr(resp.Code, resp.Message)
+	}
+	if err := validatePhotoInfo(resp); err != nil {
+		return nil, fmt.Errorf("photo info: %w", err)
 	}
 	return &resp, nil
 }

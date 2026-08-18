@@ -49,6 +49,33 @@ func TestStoreRoundTripAndDelete(t *testing.T) {
 	}
 }
 
+func TestWALSidecarPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "responses.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), "k", []byte(`{}`), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		p := path + suffix
+		info, err := os.Stat(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("%s permissions = %o, want 600", p, got)
+		}
+	}
+}
+
 func TestPhotosetStatusRoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "responses.db"))
 	if err != nil {

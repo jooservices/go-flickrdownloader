@@ -20,7 +20,8 @@ import (
 // Store is a small SQLite-backed response store. A single connection keeps
 // SQLite locking predictable while REST requests are already rate-limited.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
 const currentSchemaVersion = 7
@@ -120,11 +121,20 @@ func Open(path string) (*Store, error) {
 	}
 
 	if path != ":memory:" {
-		if err := os.Chmod(path, 0o600); err != nil && !os.IsNotExist(err) {
+		if err := protectCacheFiles(path); err != nil {
 			return closeOnError(fmt.Errorf("protect cache database: %w", err))
 		}
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, path: path}, nil
+}
+
+func protectCacheFiles(path string) error {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func migrate(db *sql.DB) error {
@@ -352,7 +362,11 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	err := s.db.Close()
+	if s.path != "" && s.path != ":memory:" {
+		_ = protectCacheFiles(s.path)
+	}
+	return err
 }
 
 // BindAuth associates this cache with the current OAuth access token. A

@@ -27,12 +27,14 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 - `--dry-run` preview — album tree, photo counts and estimated total size before anything is downloaded
 - Concurrent downloads with a configurable worker pool
 - Resumable — already-downloaded files are skipped on re-run, regardless of file extension
+- **`scan`** — index an existing download tree into completion manifests (for archives made before 1.3.0)
+- Completion manifests — unchanged albums skip Flickr listing on the next `download` (`--refresh` / `--force` to re-check)
 - Cross-album dedupe — a photo present in several albums is downloaded once and hardlinked into the others
 - Enforces Flickr's **3600 requests/hour API quota across runs** — a persisted rolling window per API key pauses requests at the cap and shows usage, reset time and an API-cost estimate for each plan
 - Account-scoped **response cache** — repeat runs reuse cached listings instead of re-fetching them, with `--refresh` / `--offline` to control that explicitly
 - **`verify`** — check downloaded photos against completion manifests without downloading or hitting the API
 - **`watch`** — a long-running mode that polls a watchlist file and downloads new photos forever, waiting out quota/rate limits instead of exiting
-- **Output-root lock** — safe to run `download`/`verify`/`watch` concurrently against different output trees; a second process against the *same* tree is rejected instead of racing
+- **Output-root lock** — safe to run `download`/`verify`/`watch`/`scan` concurrently against different output trees; a second process against the *same* tree is rejected instead of racing
 - Handles both photos and videos, always fetching the original quality available
 - Live progress bar with ETA and transfer speed
 - Actionable error messages — Flickr error codes come with hints telling you what to do
@@ -84,7 +86,7 @@ This walks you through:
 2. Opening a browser URL to authorize the app on your Flickr account
 3. Pasting back the verification code Flickr shows you
 
-Credentials are saved to `~/.config/flickrdownloader/config.json` (readable only by your user) and reused automatically on every subsequent run — you only need to do this once.
+Credentials are saved in **plaintext** to `~/.config/flickrdownloader/config.json` (mode `0600`, directory `0700`) and reused automatically on every subsequent run — you only need to do this once. Anyone who can read that file can use your Flickr API key and OAuth token; on a shared machine, keep the home directory private.
 
 ### 2. Download
 
@@ -167,7 +169,7 @@ The log is append-only, and each accepted request is written through immediately
 Every successful Flickr REST response is cached in a small, account-scoped SQLite database at `~/.config/flickrdownloader/cache-<hash>.db` (0600 permissions; separate accounts get separate databases, and re-authenticating as a different account invalidates it automatically). This is what powers `verify` and lets repeat runs against the same albums skip re-listing photos that were already fully downloaded.
 
 - Listing responses (album/photostream pages) are cached for `cache_listing_ttl_hours` (default **24h**, configurable in `config.json`); detail responses (`getSizes`, `getInfo`) for **30 days**.
-- `--refresh` bypasses the cache for one run without clearing it.
+- `--refresh` / `--force` bypasses the cache **and** completion manifests for one run without clearing them.
 - `--offline` serves only what's cached — no live requests at all — and fails clearly if nothing is cached yet for that call.
 - `flickrdownloader cache prune` removes expired entries (completion manifests are always kept, since they describe local files, not API freshness).
 - `flickrdownloader cache clear` removes everything cached for the current account.
@@ -190,6 +192,23 @@ Checks each album's local files against its saved completion manifest — no dow
 ```
 
 Add `--refresh` to re-list every album from Flickr instead of trusting the manifest — useful after manual edits to the output directory, or as a periodic integrity check.
+
+## Scan (seed manifests from disk)
+
+```bash
+flickrdownloader scan -u <flickr-user-url>
+```
+
+Walks the output directory and writes completion manifests so a later `download` can skip re-listing albums that still match disk. Uses `photosets.getList` (a few cheap API calls) to bind folders to album IDs and Flickr's `date_update`. It does **not** paginate each album.
+
+Use this after upgrading from a version that had no cache, against a tree that is already downloaded:
+
+```bash
+flickrdownloader scan -u https://www.flickr.com/photos/someuser/ -o ./photos
+flickrdownloader download -u https://www.flickr.com/photos/someuser/ -o ./photos -y
+```
+
+`--offline` indexes disk only (no Flickr calls). Those manifests cannot skip listing until a later run records `date_update`. If an album changed on Flickr with the same photo count (deleted 2, added 2), run `download --force` (or `--refresh`) to re-list it.
 
 ## Watch mode (continuous sync)
 
@@ -270,7 +289,7 @@ photos/
     <photo-id>.jpg          # photos not in any album
 ```
 
-Re-running `download` against the same target skips any file that's already on disk, so an interrupted or repeated run picks up where it left off.
+Re-running `download` against the same target skips any file that's already on disk, so an interrupted or repeated run picks up where it left off. Albums whose completion manifest still matches disk (same Flickr `date_update`, same files) also skip the per-album listing request.
 
 ## How it works
 
@@ -290,7 +309,7 @@ go vet ./...
 go test ./...
 
 # Build with a release version stamped in (used by --version and update)
-go build -ldflags "-X main.version=v1.3.0" -o flickrdownloader ./cmd/flickrdownloader
+go build -ldflags "-X main.version=v1.4.0" -o flickrdownloader ./cmd/flickrdownloader
 ```
 
 ## Robust downloads

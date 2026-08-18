@@ -30,7 +30,7 @@ func TestWorkerHardlinkDedupe(t *testing.T) {
 
 	d.worker(context.Background(), api.Photo{
 		ID:          "123",
-		URLOriginal: "https://example.invalid/never-fetched.jpg",
+		URLOriginal: "https://live.staticflickr.com/never-fetched.jpg",
 		Media:       "photo",
 	})
 
@@ -60,7 +60,7 @@ func TestWorkerSkipsExisting(t *testing.T) {
 	d := New(nil, dir, 1)
 	d.progress = ui.NewProgress(1)
 
-	d.worker(context.Background(), api.Photo{ID: "123", URLOriginal: "https://example.invalid/x.jpg", Media: "photo"})
+	d.worker(context.Background(), api.Photo{ID: "123", URLOriginal: "https://live.staticflickr.com/x.jpg", Media: "photo"})
 
 	if got := d.progress.Stats().Skipped; got != 1 {
 		t.Fatalf("expected 1 skipped, got %d", got)
@@ -266,7 +266,7 @@ func TestWorkerRegistersPathOnlyAfterSuccessfulRenameAndRemovesSiblingPart(t *te
 		return testHTTPResponse(r, http.StatusOK, "image/jpeg", "final bytes"), nil
 	})}
 	d.progress = ui.NewProgress(1)
-	d.worker(context.Background(), api.Photo{ID: "123", URLOriginal: "https://example.invalid/123.jpg", Media: "photo"})
+	d.worker(context.Background(), api.Photo{ID: "123", URLOriginal: "https://live.staticflickr.com/123.jpg", Media: "photo"})
 
 	final := filepath.Join(dir, "123.jpg")
 	if !exists(final) {
@@ -285,7 +285,7 @@ func TestWorkerRegistersPathOnlyAfterSuccessfulRenameAndRemovesSiblingPart(t *te
 		return testHTTPResponse(r, http.StatusForbidden, "", ""), nil
 	})}
 	failed.progress = ui.NewProgress(1)
-	failed.worker(context.Background(), api.Photo{ID: "456", URLOriginal: "https://example.invalid/456.jpg", Media: "photo"})
+	failed.worker(context.Background(), api.Photo{ID: "456", URLOriginal: "https://live.staticflickr.com/456.jpg", Media: "photo"})
 	if _, ok := failed.downloadedPaths["456"]; ok {
 		t.Fatal("failed download must not be registered for cross-album dedupe")
 	}
@@ -352,8 +352,8 @@ func TestSweepPreservesEnqueuedIDArtifacts(t *testing.T) {
 
 	stats := d.downloadPhotosFromPages(context.Background(), 2, 1, true, false, func(context.Context, int) ([]api.Photo, error) {
 		return []api.Photo{
-			{ID: "active", URLOriginal: "https://example.invalid/active.jpg", Media: "photo"},
-			{ID: "queued", URLOriginal: "https://example.invalid/queued.jpg", Media: "photo"},
+			{ID: "active", URLOriginal: "https://live.staticflickr.com/active.jpg", Media: "photo"},
+			{ID: "queued", URLOriginal: "https://live.staticflickr.com/queued.jpg", Media: "photo"},
 		}, nil
 	})
 
@@ -391,5 +391,61 @@ func testHTTPResponse(r *http.Request, status int, contentType, body string) *ht
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: -1,
 		Request:       r,
+	}
+}
+
+func TestSafeNameWindowsReservedAndRunes(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"CON", "CON_"},
+		{"nul", "nul_"},
+		{"COM1", "COM1_"},
+		{"lpt9.txt", "lpt9.txt_"},
+		{"Album.", "Album"},
+		{"Album  ", "Album"},
+		{"photos / trip", "photos _ trip"},
+		{"", "untitled"},
+		{"...", "untitled"},
+	}
+	for _, c := range cases {
+		if got := SafeName(c.in); got != c.want {
+			t.Errorf("SafeName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	long := strings.Repeat("相", 130)
+	got := SafeName(long)
+	if n := len([]rune(got)); n != 120 {
+		t.Fatalf("SafeName long CJK = %d runes, want 120", n)
+	}
+}
+
+func TestAlreadyDownloadedUsesIndexWithoutGlob(t *testing.T) {
+	dir := t.TempDir()
+	d := New(nil, dir, 1)
+	writeFile(t, filepath.Join(dir, "12345678.jpg"), []byte("ok"))
+	if err := d.WarmLocalIndex(); err != nil {
+		t.Fatal(err)
+	}
+	if !d.alreadyDownloaded("12345678") {
+		t.Fatal("indexed file should count as already downloaded")
+	}
+}
+
+func TestCleanExtAllowlistAndHost(t *testing.T) {
+	if got := cleanExt("mp4?foo=1"); got != "mp4" {
+		t.Fatalf("cleanExt mp4 = %q", got)
+	}
+	if got := cleanExt("exe"); got != "jpg" {
+		t.Fatalf("cleanExt exe = %q, want jpg fallback", got)
+	}
+	if !allowedDownloadHost("live.staticflickr.com") || !allowedDownloadHost("farm1.static.flickr.com") {
+		t.Fatal("expected Flickr CDN hosts to be allowed")
+	}
+	if allowedDownloadHost("evil.example") || allowedDownloadURL("https://127.0.0.1/x.jpg") {
+		t.Fatal("expected non-Flickr hosts to be rejected")
+	}
+	if _, _, err := acceptDownloadURL("https://evil.example/x.jpg"); err == nil {
+		t.Fatal("expected non-Flickr download URL to be rejected")
 	}
 }

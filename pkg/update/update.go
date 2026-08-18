@@ -176,7 +176,9 @@ func Install(ctx context.Context, rel *Release, a *Asset) error {
 	if err := os.Chmod(exe, 0o755); err != nil {
 		fmt.Printf("  warning: could not set permissions: %v\n", err)
 	}
-	os.Remove(backup)
+	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("  warning: left %s in place (%v) — Windows cannot delete a running executable; remove it after restart\n", backup, err)
+	}
 	return nil
 }
 

@@ -12,7 +12,10 @@
 // next to the ~1/sec pacing already applied. flock is held for the current
 // process's lifetime only, so a crash or kill releases it automatically;
 // there's no stale-lock case to clean up. A torn trailing line from a hard
-// kill mid-write is simply ignored on the next read.
+// kill mid-write is simply ignored on the next read. When a reload sees
+// more than compactStaleThreshold expired lines the log is rewritten; the
+// read handle is closed first so the replace works on Windows, and a
+// failed compact is logged once then retried after compactRetryAfter.
 package quota
 
 import (
@@ -40,9 +43,23 @@ const DefaultInterval = 1050 * time.Millisecond
 // window is the rolling window of the hourly quota.
 const window = time.Hour
 
-// compactStaleThreshold rewrites the log at load time once this many lines
-// were older than the window (crash residue / long-lived installs).
+// compactStaleThreshold rewrites the log once this many lines were older
+// than the window (crash residue / long-lived installs). The rewrite can
+// run on any reload, not only process start, so a long-lived watch process
+// still sheds residue.
 const compactStaleThreshold = 10000
+
+// compactRetryAfter is how long a Tracker waits after a failed compact
+// before trying again. Without this, a Windows ACCESS_DENIED loops every
+// request (~1/s) and log.Printf tears the progress bar.
+const compactRetryAfter = 5 * time.Minute
+
+// replaceAttempts / replaceRetryDelay ride out transient Windows locks
+// (Defender, Search Indexer) after our own handle is closed.
+const (
+	replaceAttempts   = 5
+	replaceRetryDelay = 20 * time.Millisecond
+)
 
 // lockRetryDelay is how often TryLockContext polls for the interprocess
 // lock while waiting for another process to release it.
@@ -72,6 +89,11 @@ type Tracker struct {
 	waiting   bool
 	waitUntil time.Time
 
+	compactAfter     int // stale-line count that triggers a rewrite
+	compactHoldUntil time.Time
+	compactWarned    bool
+	replaceFile      func(tmp, dest string) error
+
 	Now   func() time.Time // injectable for tests
 	Sleep func(context.Context, time.Duration) error
 }
@@ -80,13 +102,23 @@ type Tracker struct {
 // hourlyLimit <= 0 uses DefaultHourlyLimit; interval <= 0 disables the
 // per-request pacing.
 func New(path string, hourlyLimit int, interval time.Duration) (*Tracker, error) {
+	t := newTracker(path, hourlyLimit, interval)
+	if err := t.load(); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func newTracker(path string, hourlyLimit int, interval time.Duration) *Tracker {
 	if hourlyLimit <= 0 {
 		hourlyLimit = DefaultHourlyLimit
 	}
 	t := &Tracker{
-		path:  path,
-		limit: hourlyLimit,
-		Now:   time.Now,
+		path:         path,
+		limit:        hourlyLimit,
+		Now:          time.Now,
+		compactAfter: compactStaleThreshold,
+		replaceFile:  replaceQuotaLog,
 	}
 	if path != "" {
 		t.flock = flock.New(path + ".lock")
@@ -94,10 +126,7 @@ func New(path string, hourlyLimit int, interval time.Duration) (*Tracker, error)
 	if interval > 0 {
 		t.rate = rate.NewLimiter(rate.Every(interval), 1)
 	}
-	if err := t.load(); err != nil {
-		return nil, err
-	}
-	return t, nil
+	return t
 }
 
 // Wait blocks until a request is allowed by both the per-request interval and
@@ -273,7 +302,6 @@ func (t *Tracker) rawLoadLocked(now time.Time) error {
 		}
 		return fmt.Errorf("open quota log: %w", err)
 	}
-	defer f.Close()
 
 	cutoff := now.Unix() - int64(window/time.Second)
 	var kept []int64
@@ -294,17 +322,42 @@ func (t *Tracker) rawLoadLocked(now time.Time) error {
 			kept = append(kept, ts)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read quota log: %w", err)
+	readErr := sc.Err()
+	// Close before compact: Windows cannot rename over an open file
+	// (ERROR_ACCESS_DENIED). Unix rename is fine either way.
+	closeErr := f.Close()
+	if readErr != nil {
+		return fmt.Errorf("read quota log: %w", readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close quota log: %w", closeErr)
 	}
 	t.entries = kept
 	t.flushed = len(kept)
-	if stale > compactStaleThreshold {
-		if err := t.compactLocked(); err != nil {
-			log.Printf("quota: compact %s: %v", t.path, err)
-		}
-	}
+	t.maybeCompactLocked(now, stale)
 	return nil
+}
+
+// maybeCompactLocked rewrites the log when stale residue exceeds the
+// threshold. Failures are non-fatal: the in-memory window is already
+// correct, and a later reload can try again after compactRetryAfter.
+func (t *Tracker) maybeCompactLocked(now time.Time, stale int) {
+	if stale <= t.compactAfter {
+		return
+	}
+	if !t.compactHoldUntil.IsZero() && now.Before(t.compactHoldUntil) {
+		return
+	}
+	if err := t.compactLocked(); err != nil {
+		t.compactHoldUntil = now.Add(compactRetryAfter)
+		if !t.compactWarned {
+			t.compactWarned = true
+			log.Printf("quota: compact %s: %v (will retry later)", t.path, err)
+		}
+		return
+	}
+	t.compactHoldUntil = time.Time{}
+	t.compactWarned = false
 }
 
 // trimLocked drops entries older than the rolling window, adjusting the flush
@@ -353,7 +406,8 @@ func (t *Tracker) flushLocked() error {
 }
 
 // compactLocked rewrites the log with only live entries via a temp file +
-// rename, so the rewrite is atomic. The caller holds mu.
+// replace. The caller holds mu and the interprocess flock, and must not
+// hold an open handle on t.path (Windows cannot replace an open file).
 func (t *Tracker) compactLocked() error {
 	if t.path == "" {
 		return nil
@@ -382,9 +436,47 @@ func (t *Tracker) compactLocked() error {
 		os.Remove(tmp)
 		return fmt.Errorf("close temp quota log: %w", err)
 	}
-	if err := os.Rename(tmp, t.path); err != nil {
+	replace := t.replaceFile
+	if replace == nil {
+		replace = replaceQuotaLog
+	}
+	if err := replace(tmp, t.path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("replace quota log: %w", err)
+	}
+	return nil
+}
+
+// replaceQuotaLog installs tmp at dest. It retries a transient failure,
+// then falls back to remove+rename (safe while the caller holds flock).
+func replaceQuotaLog(tmp, dest string) error {
+	return replaceFileWith(tmp, dest, os.Rename, os.Remove, time.Sleep)
+}
+
+func replaceFileWith(
+	tmp, dest string,
+	rename func(oldpath, newpath string) error,
+	remove func(string) error,
+	sleep func(time.Duration),
+) error {
+	var last error
+	for i := 0; i < replaceAttempts; i++ {
+		if i > 0 {
+			sleep(time.Duration(i) * replaceRetryDelay)
+		}
+		if err := rename(tmp, dest); err != nil {
+			last = err
+			continue
+		}
+		return nil
+	}
+	if err := remove(dest); err != nil && !os.IsNotExist(err) {
+		_ = remove(tmp)
+		return last
+	}
+	if err := rename(tmp, dest); err != nil {
+		_ = remove(tmp)
+		return err
 	}
 	return nil
 }

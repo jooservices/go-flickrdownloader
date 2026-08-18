@@ -67,9 +67,11 @@ var (
 	uncategorized   bool
 	updateCheckOnly bool
 	refreshFlag     bool
+	forceFlag       bool
 	offlineFlag     bool
 
 	verifyRefreshFlag bool
+	scanOfflineFlag   bool
 
 	watchFile         string
 	watchPollInterval time.Duration
@@ -93,10 +95,12 @@ func main() {
 	}
 
 	downloadCmd := &cobra.Command{
-		Use:     "download -u <flickr-url>",
-		Short:   "Download photos from a Flickr URL",
-		PreRunE: func(cmd *cobra.Command, args []string) error { return rejectRefreshOffline(refreshFlag, offlineFlag) },
-		RunE:    runDownload,
+		Use:   "download -u <flickr-url>",
+		Short: "Download photos from a Flickr URL",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return rejectRefreshOffline(refreshFlag || forceFlag, offlineFlag)
+		},
+		RunE: runDownload,
 	}
 	downloadCmd.Flags().StringVarP(&urlFlag, "url", "u", "", "Flickr URL (user / album / photo)")
 	downloadCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory (default: from config, normally ./photos)")
@@ -105,7 +109,8 @@ func main() {
 	downloadCmd.Flags().BoolVarP(&yesFlag, "yes", "y", false, "Skip the confirmation prompt and the album picker (download everything)")
 	downloadCmd.Flags().StringVar(&albumsFlag, "albums", "", "Only download matching albums (comma-separated names, 'all' or 'none')")
 	downloadCmd.Flags().BoolVar(&uncategorized, "uncategorized", true, "Include photos that are not in any album")
-	downloadCmd.Flags().BoolVar(&refreshFlag, "refresh", false, "Bypass cached metadata and completion manifests, re-check everything against Flickr")
+	downloadCmd.Flags().BoolVar(&refreshFlag, "refresh", false, "Bypass cached metadata and completion manifests, re-list every album from Flickr")
+	downloadCmd.Flags().BoolVar(&forceFlag, "force", false, "Alias for --refresh")
 	downloadCmd.Flags().BoolVar(&offlineFlag, "offline", false, "Use cached Flickr responses only; never make a live request")
 
 	verifyCmd := &cobra.Command{
@@ -117,6 +122,19 @@ func main() {
 	verifyCmd.Flags().StringVarP(&urlFlag, "url", "u", "", "Flickr URL (user)")
 	verifyCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory (default: from config, normally ./photos)")
 	verifyCmd.Flags().BoolVar(&verifyRefreshFlag, "refresh", false, "Re-check the current Flickr listing instead of trusting cached manifests")
+
+	scanCmd := &cobra.Command{
+		Use:   "scan -u <flickr-url>",
+		Short: "Index already-downloaded files into completion manifests without downloading",
+		Long: "Walk the output directory and write photoset completion manifests so a later download\n" +
+			"can skip re-listing albums that still match disk. By default this calls photosets.getList\n" +
+			"(cheap) to bind folders to album IDs and date_update. --offline writes disk-only manifests\n" +
+			"and cannot skip listing until a later run records Flickr's date_update.",
+		RunE: runScan,
+	}
+	scanCmd.Flags().StringVarP(&urlFlag, "url", "u", "", "Flickr URL (user)")
+	scanCmd.Flags().StringVarP(&outDir, "out", "o", "", "Output directory (default: from config, normally ./photos)")
+	scanCmd.Flags().BoolVar(&scanOfflineFlag, "offline", false, "Index disk only; do not call Flickr (manifests will not skip listing until date_update is known)")
 
 	watchCmd := &cobra.Command{
 		Use:   "watch",
@@ -213,6 +231,7 @@ func main() {
 	rootCmd.AddCommand(authCmd)
 	rootCmd.AddCommand(downloadCmd)
 	rootCmd.AddCommand(verifyCmd)
+	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(watchCmd)
 	rootCmd.AddCommand(cacheCmd)
 	rootCmd.AddCommand(updateCmd)
@@ -269,6 +288,7 @@ func lockOutputRoot(rootDir string) (func() error, error) {
 	if err := os.MkdirAll(rootDir, 0755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
+	rootDir = download.CanonicalPath(rootDir)
 	fl := flock.New(filepath.Join(rootDir, ".flickrdownloader.lock"))
 	locked, err := fl.TryLock()
 	if err != nil {
@@ -580,18 +600,11 @@ func levenshtein(a, b string) int {
 			if a[i-1] == b[j-1] {
 				cost = 0
 			}
-			d[j] = minInt(d[j]+1, minInt(d[j-1]+1, prev+cost))
+			d[j] = min(d[j]+1, min(d[j-1]+1, prev+cost))
 			prev = temp
 		}
 	}
 	return d[lb]
-}
-
-func minInt(a, b int) int {
-	if b < a {
-		return b
-	}
-	return a
 }
 
 // downloadOnceOptions controls one download pass, shared by the `download`
@@ -1028,6 +1041,7 @@ func runDownload(cmd *cobra.Command, args []string) error {
 
 	dl := download.New(client, cfg.OutputDir, cfg.WorkerCount)
 	dl.Cache = store
+	dl.Refresh = refreshFlag || forceFlag
 	if err := dl.WarmLocalIndex(); err != nil {
 		fmt.Fprintf(os.Stderr, "  %s%s index local files: %v%s\n", ui.ColorYellow, ui.IconErr, err, ui.ColorReset)
 	}
@@ -1157,6 +1171,106 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runScan(cmd *cobra.Command, args []string) error {
+	if urlFlag == "" {
+		return fmt.Errorf("provide -u <flickr-url>")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if outDir != "" {
+		cfg.OutputDir = outDir
+	}
+
+	tr, err := newQuotaTracker(cfg)
+	if err != nil {
+		return err
+	}
+	defer flushQuotaOnExit(tr)()
+
+	client, store, err := newClientWithCache(cfg, tr, false, scanOfflineFlag)
+	if err != nil {
+		return err
+	}
+	if store == nil {
+		return fmt.Errorf("scan requires the response cache to be available — check that ~/.config/flickrdownloader is writable")
+	}
+	defer store.Close()
+
+	unlock, err := lockOutputRoot(cfg.OutputDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	ctx, stop := setupSignalContext()
+	defer stop()
+
+	parsed, err := api.ResolveURL(ctx, urlFlag, client)
+	if err != nil {
+		return fmt.Errorf("resolve URL '%s': %w", urlFlag, err)
+	}
+	if parsed.Type != api.TargetUser {
+		return fmt.Errorf("scan currently supports user URLs only")
+	}
+
+	dl := download.New(client, cfg.OutputDir, cfg.WorkerCount)
+	dl.Cache = store
+
+	var sets []api.PhotoSetInfo
+	if !scanOfflineFlag {
+		listed, err := client.GetPhotosets(ctx, parsed.ID)
+		if err != nil {
+			return fmt.Errorf("list photosets: %w", err)
+		}
+		sets = listed
+	}
+
+	report, err := dl.ScanUser(ctx, parsed.ID, sets)
+	if err != nil {
+		return fmt.Errorf("scan: %w", err)
+	}
+	printScanReport(report, scanOfflineFlag)
+	return nil
+}
+
+func printScanReport(report *download.ScanReport, offline bool) {
+	fmt.Printf("\n%s\n\n", ui.Bordered("Scan", ui.ColorCyan))
+	if offline {
+		fmt.Printf("  %sDisk-only — manifests cannot skip listing until Flickr date_update is recorded%s\n\n",
+			ui.ColorYellow, ui.ColorReset)
+	}
+
+	for _, v := range report.Photosets {
+		col, sym := ui.ColorGreen, "✓"
+		detail := fmt.Sprintf("%d files on disk", v.Present)
+		if v.ExpectedRemote > 0 || v.Present == 0 {
+			detail = fmt.Sprintf("%d/%d files on disk", v.Present, v.ExpectedRemote)
+		}
+		if !v.Complete {
+			col, sym = ui.ColorYellow, "⚠"
+			if v.ExpectedRemote > v.Present {
+				detail += fmt.Sprintf(" (%d missing vs Flickr)", v.ExpectedRemote-v.Present)
+			}
+		}
+		fmt.Printf("  %s%s%s %-32s %s%s%s\n", col, sym, ui.ColorReset, v.Title, ui.ColorDim, detail, ui.ColorReset)
+	}
+	if report.Uncategorized != nil {
+		fmt.Printf("  %s·%s %-32s %s%d uncategorized files%s\n",
+			ui.ColorDim, ui.ColorReset, report.Uncategorized.Title, ui.ColorDim, report.Uncategorized.Present, ui.ColorReset)
+	}
+	for _, v := range report.Unmatched {
+		fmt.Printf("  %s·%s %-32s %s%d files, folder not matched to a Flickr album%s\n",
+			ui.ColorDim, ui.ColorReset, v.Title, ui.ColorDim, v.Present, ui.ColorReset)
+	}
+	if len(report.Photosets) == 0 && report.Uncategorized == nil && len(report.Unmatched) == 0 {
+		fmt.Printf("  %sno downloaded photos found under the output directory%s\n", ui.ColorDim, ui.ColorReset)
+	}
+	fmt.Println()
+}
+
 // resolveWatchlistPath returns the watchlist file to operate on, honoring
 // --file, then the first existing default, and finally the first default path
 // when allowMissing (used by `watch add`, which creates the file).
@@ -1198,10 +1312,14 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		defer f.Close()
 		writers = append(writers, f)
 	}
+	logWriteWarned := false
 	logf := func(format string, args ...any) {
 		line := fmt.Sprintf("%s INFO %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, args...))
 		for _, w := range writers {
-			fmt.Fprint(w, line)
+			if _, err := fmt.Fprint(w, line); err != nil && !logWriteWarned {
+				logWriteWarned = true
+				fmt.Fprintf(os.Stderr, "  warning: write log: %v\n", err)
+			}
 		}
 	}
 
@@ -1219,6 +1337,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer unlock()
+	lockedRoots := map[string]bool{download.CanonicalPath(outDirDefault): true}
 
 	tr, err := newQuotaTracker(cfg)
 	if err != nil {
@@ -1246,6 +1365,13 @@ func runWatch(cmd *cobra.Command, args []string) error {
 			if src.OutputDir != "" {
 				srcOut = src.OutputDir
 			}
+			if canon := download.CanonicalPath(srcOut); !lockedRoots[canon] {
+				unlockSrc, lockErr := lockOutputRoot(srcOut)
+				if lockErr != nil {
+					return lockErr
+				}
+				defer unlockSrc()
+			}
 			srcWorkers := workerDefault
 			if src.Workers > 0 {
 				srcWorkers = src.Workers
@@ -1253,6 +1379,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 
 			dl := download.New(client, srcOut, srcWorkers)
 			dl.Cache = store
+			dl.Logf = logf
 			if err := dl.WarmLocalIndex(); err != nil {
 				logf("source=%s status=index_warning err=%q", src.URL, err.Error())
 			}

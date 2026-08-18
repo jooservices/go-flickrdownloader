@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jooservices/flickrdownloader/pkg/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -184,28 +185,6 @@ func removeTextSources(path string, remove map[string]bool) ([]string, error) {
 	return removed, writeFileAtomic(path, []byte(out), 0o600)
 }
 
-// writeFileAtomic writes data to a temp file in the same directory and renames
-// it over path, so a concurrently-running `watch` never sees a half-written
-// watchlist. The temp file is created with mode so the final file never has
-// looser permissions.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return config.WriteFileAtomic(path, data, mode)
 }

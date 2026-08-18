@@ -1,11 +1,14 @@
 package quota
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -341,5 +344,367 @@ func TestInterprocessSharedBudget(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("Wait: %v", err)
+	}
+}
+
+func writeQuotaLog(t *testing.T, path string, ts ...int64) {
+	t.Helper()
+	var b strings.Builder
+	for _, v := range ts {
+		fmt.Fprintf(&b, "%d\n", v)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func quotaLogLines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.TrimSpace(string(data))
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
+
+func startTracker(t *testing.T, path string, limit, compactAfter int, clock *fakeClock) *Tracker {
+	t.Helper()
+	tk := newTracker(path, limit, 0)
+	tk.compactAfter = compactAfter
+	if clock != nil {
+		tk.Now = clock.Now
+		tk.Sleep = clock.Sleep
+	}
+	if err := tk.load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	return tk
+}
+
+func staleAndLive(now time.Time, stale, live int) []int64 {
+	base := now.Unix()
+	out := make([]int64, 0, stale+live)
+	for i := 0; i < stale; i++ {
+		out = append(out, base-7200)
+	}
+	for i := 0; i < live; i++ {
+		out = append(out, base-int64(60+i))
+	}
+	return out
+}
+
+func TestCompactRewritesLiveEntriesOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 5, 2)...)
+
+	tk := startTracker(t, path, 100, 3, clock)
+	if got := tk.Snapshot().Used; got != 2 {
+		t.Fatalf("used = %d, want 2", got)
+	}
+	lines := quotaLogLines(t, path)
+	if len(lines) != 2 {
+		t.Fatalf("log lines = %d, want 2 (stale residue should be gone): %v", len(lines), lines)
+	}
+	cutoff := clock.Now().Unix() - int64(window/time.Second)
+	for _, line := range lines {
+		var ts int64
+		if _, err := fmt.Sscan(line, &ts); err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if ts <= cutoff {
+			t.Fatalf("stale timestamp %d left in compacted log", ts)
+		}
+	}
+}
+
+func TestCompactThenWaitAppendsToRewrittenLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 4, 1)...)
+
+	tk := startTracker(t, path, 100, 2, clock)
+	if err := tk.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lines := quotaLogLines(t, path)
+	if len(lines) != 2 {
+		t.Fatalf("log lines = %d, want 2 (1 live + 1 new)", len(lines))
+	}
+	if got := tk.Snapshot().Used; got != 2 {
+		t.Fatalf("used = %d, want 2", got)
+	}
+}
+
+func TestCompactVisibleToSiblingTracker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 6, 3)...)
+
+	_ = startTracker(t, path, 100, 4, clock)
+
+	tk2, err := New(path, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tk2.Snapshot().Used; got != 3 {
+		t.Fatalf("sibling used = %d, want 3", got)
+	}
+	if n := len(quotaLogLines(t, path)); n != 3 {
+		t.Fatalf("sibling saw %d lines, want 3", n)
+	}
+}
+
+func TestCompactFailureDoesNotBlockWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 4, 1)...)
+
+	tk := newTracker(path, 100, 0)
+	tk.compactAfter = 2
+	tk.Now = clock.Now
+	tk.replaceFile = func(tmp, dest string) error {
+		os.Remove(tmp)
+		return errors.New("Access is denied.")
+	}
+	if err := tk.load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait after failed compact: %v", err)
+	}
+	if got := tk.Snapshot().Used; got != 2 {
+		t.Fatalf("used = %d, want 2", got)
+	}
+}
+
+func TestCompactNotRetriedDuringBackoff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 4, 1)...)
+
+	calls := 0
+	tk := newTracker(path, 100, 0)
+	tk.compactAfter = 2
+	tk.Now = clock.Now
+	tk.Sleep = clock.Sleep
+	tk.replaceFile = func(tmp, dest string) error {
+		calls++
+		os.Remove(tmp)
+		return errors.New("Access is denied.")
+	}
+	if err := tk.load(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("compact calls after load = %d, want 1", calls)
+	}
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		if err := tk.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("compact retried during backoff: %d calls", calls)
+	}
+}
+
+func TestCompactRetriesAfterBackoff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 4, 1)...)
+
+	calls := 0
+	tk := newTracker(path, 100, 0)
+	tk.compactAfter = 2
+	tk.Now = clock.Now
+	tk.Sleep = clock.Sleep
+	tk.replaceFile = func(tmp, dest string) error {
+		calls++
+		if calls == 1 {
+			os.Remove(tmp)
+			return errors.New("Access is denied.")
+		}
+		return os.Rename(tmp, dest)
+	}
+	if err := tk.load(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("compact calls before backoff elapsed = %d, want 1", calls)
+	}
+
+	clock.advance(compactRetryAfter)
+	if err := tk.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("compact calls after backoff = %d, want 2", calls)
+	}
+	lines := quotaLogLines(t, path)
+	cutoff := clock.Now().Unix() - int64(window/time.Second)
+	for _, line := range lines {
+		var ts int64
+		if _, err := fmt.Sscan(line, &ts); err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if ts <= cutoff {
+			t.Fatalf("stale timestamp %d left after successful retry", ts)
+		}
+	}
+}
+
+func TestCompactFailureLoggedOnce(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	path := filepath.Join(t.TempDir(), "quota.log")
+	clock := newFakeClock(time.Now())
+	writeQuotaLog(t, path, staleAndLive(clock.Now(), 4, 1)...)
+
+	tk := newTracker(path, 100, 0)
+	tk.compactAfter = 2
+	tk.Now = clock.Now
+	tk.Sleep = clock.Sleep
+	tk.replaceFile = func(tmp, dest string) error {
+		os.Remove(tmp)
+		return errors.New("Access is denied.")
+	}
+	if err := tk.load(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		if err := tk.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clock.advance(compactRetryAfter)
+	if err := tk.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got := buf.String()
+	if n := strings.Count(got, "quota: compact"); n != 1 {
+		t.Fatalf("compact log lines = %d, want 1:\n%s", n, got)
+	}
+	if !strings.Contains(got, "will retry later") {
+		t.Fatalf("missing backoff hint in log: %q", got)
+	}
+}
+
+func TestReplaceQuotaLogOverwritesDest(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "quota.log")
+	tmp := dest + ".tmp"
+	if err := os.WriteFile(dest, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceQuotaLog(tmp, dest); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new\n" {
+		t.Fatalf("dest = %q, want %q", data, "new\n")
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Fatal("tmp should be gone after replace")
+	}
+}
+
+func TestReplaceFileRetriesThenRemoveFallback(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "quota.log")
+	tmp := dest + ".tmp"
+	if err := os.WriteFile(dest, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	renames := 0
+	err := replaceFileWith(tmp, dest,
+		func(oldpath, newpath string) error {
+			renames++
+			if renames <= replaceAttempts {
+				return errors.New("Access is denied.")
+			}
+			return os.Rename(oldpath, newpath)
+		},
+		os.Remove,
+		func(time.Duration) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renames != replaceAttempts+1 {
+		t.Fatalf("renames = %d, want %d (retries + fallback)", renames, replaceAttempts+1)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new\n" {
+		t.Fatalf("dest = %q, want %q", data, "new\n")
+	}
+}
+
+func TestReplaceFileGivesUpWhenDestStuck(t *testing.T) {
+	err := replaceFileWith("tmp", "dest",
+		func(string, string) error { return errors.New("Access is denied.") },
+		func(string) error { return errors.New("busy") },
+		func(time.Duration) {},
+	)
+	if err == nil || err.Error() != "Access is denied." {
+		t.Fatalf("err = %v, want original rename error", err)
+	}
+}
+
+func TestReplaceFileLeavesDestWhenOpen(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("rename-over-open-file only fails on Windows")
+	}
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "quota.log")
+	tmp := dest + ".tmp"
+	if err := os.WriteFile(dest, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("new\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	err = replaceFileWith(tmp, dest, os.Rename, os.Remove, func(time.Duration) {})
+	if err == nil {
+		t.Fatal("expected replace to fail while dest is open")
+	}
+	data, readErr := os.ReadFile(dest)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(data) != "old\n" {
+		t.Fatalf("dest mutated while open: %q", data)
 	}
 }

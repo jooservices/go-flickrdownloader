@@ -11,6 +11,7 @@
 ### Changed
 
 - The CLI is split across `cmd/flickrdownloader/cmd_*.go` files; command names and flags are unchanged.
+- Builds and CI use Go 1.25.13 so `govulncheck` is clean against patched `crypto/tls` / `crypto/x509` (and related stdlib CVEs).
 
 ## [1.4.0] - 2026-08-17
 

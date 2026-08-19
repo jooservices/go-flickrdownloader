@@ -24,7 +24,7 @@ type Store struct {
 	path string
 }
 
-const currentSchemaVersion = 7
+const currentSchemaVersion = 8
 
 const authFingerprintKey = "auth_fingerprint"
 
@@ -67,6 +67,20 @@ const createCacheMetaTable = `
 	CREATE TABLE IF NOT EXISTS cache_meta (
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
+	)`
+
+const createWatchlistTable = `
+	CREATE TABLE IF NOT EXISTS watchlist (
+		id                INTEGER PRIMARY KEY AUTOINCREMENT,
+		source_url        TEXT NOT NULL UNIQUE,
+		albums            TEXT NOT NULL DEFAULT 'all',
+		include_orphans   INTEGER NOT NULL DEFAULT 1,
+		poll_interval_ns  INTEGER NOT NULL DEFAULT 0,
+		output_dir        TEXT NOT NULL DEFAULT '',
+		workers           INTEGER NOT NULL DEFAULT 0,
+		enabled           INTEGER NOT NULL DEFAULT 1,
+		created_at        INTEGER NOT NULL,
+		updated_at        INTEGER NOT NULL
 	)`
 
 // PhotosetStatus is the persisted local verification manifest for one
@@ -221,12 +235,16 @@ func migrate(db *sql.DB) error {
 	if _, err := tx.Exec(createCacheMetaTable); err != nil {
 		return rollback(fmt.Errorf("create cache meta schema: %w", err))
 	}
+	if _, err := tx.Exec(createWatchlistTable); err != nil {
+		return rollback(fmt.Errorf("create watchlist schema: %w", err))
+	}
 	for table, columns := range map[string][]string{
 		"responses":       {"cache_key", "body", "fetched_at", "method"},
 		"photoset_status": {"root_dir", "owner_nsid", "photoset_id", "title", "directory", "expected_ids", "complete", "source_updated_at", "file_sizes", "verified_at"},
 		"photo_metadata":  {"photo_id", "url", "media", "original_format", "extension", "o_width", "o_height", "size_bytes", "updated_at"},
 		"response_leases": {"cache_key", "owner", "expires_at"},
 		"cache_meta":      {"key", "value"},
+		"watchlist":       {"id", "source_url", "albums", "include_orphans", "poll_interval_ns", "output_dir", "workers", "enabled", "created_at", "updated_at"},
 	} {
 		if err := requireColumns(tx, table, columns); err != nil {
 			return rollback(err)
@@ -287,7 +305,14 @@ func detectSchemaVersion(tx *sql.Tx) (int, error) {
 						return 0, fmt.Errorf("inspect cache meta schema: %w", err)
 					}
 					if meta {
-						return currentSchemaVersion, nil
+						watchlist, err := tableExists(tx, "watchlist")
+						if err != nil {
+							return 0, fmt.Errorf("inspect watchlist schema: %w", err)
+						}
+						if watchlist {
+							return currentSchemaVersion, nil
+						}
+						return 7, nil
 					}
 					return 6, nil
 				}
@@ -312,6 +337,7 @@ var knownCacheTables = map[string]struct{}{
 	"photo_metadata":  {},
 	"response_leases": {},
 	"cache_meta":      {},
+	"watchlist":       {},
 }
 
 func tableColumns(tx *sql.Tx, table string) (map[string]bool, error) {
@@ -516,7 +542,8 @@ func (s *Store) Prune(ctx context.Context, now time.Time, listingTTL, detailTTL 
 }
 
 // Clear removes cached responses, photo metadata, leases, and photoset
-// manifests for the account.
+// manifests for the account. The watchlist table and watch.* cache_meta
+// keys are retained so `cache clear` cannot drop the user's sources.
 func (s *Store) Clear(ctx context.Context) (int64, error) {
 	if s == nil || s.db == nil {
 		return 0, fmt.Errorf("cache is not open")

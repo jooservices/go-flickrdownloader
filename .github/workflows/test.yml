@@ -12,7 +12,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: "stable"
+          go-version-file: go.mod
+      - name: Format
+        run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
       - name: Test
@@ -21,3 +23,5 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
+      - name: Windows cross-build
+        run: GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/flickrdownloader

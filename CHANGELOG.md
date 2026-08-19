@@ -1,6 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [1.5.0] - 2026-08-18
+
+### Added
+
+- Watchlist sources now live in the account cache database by default. `watch list` / `add` / `remove` (and `watch` itself) require auth; pass `--file` to keep using a YAML or text watchlist. Existing `watchlist.yaml` / `sources.txt` files are imported once and renamed to `*.migrated`. `cache clear` does not delete the watchlist.
+- Failed photo downloads print the reason immediately and again in a grouped summary at the end of the run.
+- Failures are persisted in `<output>/.flickrdownloader.failures.jsonl` (moves with the photo tree). Every `download` / `watch` start retries that list first, before listing albums or fetching anything new. A later success removes the entry.
+
+### Changed
+
+- The CLI is split across `cmd/flickrdownloader/cmd_*.go` files; command names and flags are unchanged.
 
 ## [1.4.0] - 2026-08-17
 

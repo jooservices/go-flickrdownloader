@@ -169,14 +169,16 @@ func (d *Downloader) clearFailure(id, rel string) {
 	d.failMu.Lock()
 	defer d.failMu.Unlock()
 	recs := d.loadFailures()
+	removed := false
 	out := recs[:0]
 	for _, rec := range recs {
 		if rec.ID == id && rec.Rel == rel {
+			removed = true
 			continue
 		}
 		out = append(out, rec)
 	}
-	if len(out) == len(recs) {
+	if !removed {
 		// Nothing was actually removed — this photo had no pending failure
 		// record (the common case: recordPhotoSuccess calls this on every
 		// successful download, not just ones that clear a real failure).
@@ -256,13 +258,18 @@ func (d *Downloader) RetryFailedFirst(ctx context.Context) {
 		if err != nil {
 			d.failMu.Lock()
 			left := d.loadFailures()
+			removed := false
 			kept := left[:0]
 			for _, existing := range left {
-				if existing.key() != rec.key() {
-					kept = append(kept, existing)
+				if existing.key() == rec.key() {
+					removed = true
+					continue
 				}
+				kept = append(kept, existing)
 			}
-			_ = d.saveFailures(kept)
+			if removed {
+				_ = d.saveFailures(kept)
+			}
 			d.failMu.Unlock()
 			continue
 		}

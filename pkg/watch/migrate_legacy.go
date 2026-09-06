@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/jooservices/flickrdownloader/pkg/cache"
@@ -50,6 +51,16 @@ func ImportLegacyFiles(ctx context.Context, store *cache.Store) error {
 // regardless — silently and permanently discarding every URL in a second
 // legacy file whenever both watchlist.yaml and sources.txt existed, with no
 // error, warning, or way to re-trigger the import.
+//
+// A file that exists but fails to parse is skipped with a warning rather
+// than aborting the whole import: reading every found file (instead of
+// stopping at the first) means one malformed file must not be able to block
+// import of another, valid file found alongside it — the one-shot import
+// flag would otherwise get set on failure, permanently discarding the good
+// file's URLs too, with the only recourse being to find and fix or remove
+// the malformed one by hand. Only successfully loaded files are reported in
+// found (and so only those get renamed to *.migrated by the caller) — a
+// skipped file is left at its original path, discoverable to fix.
 func loadAllLegacyWatchlists() (*Config, []string, error) {
 	var merged *Config
 	var found []string
@@ -60,11 +71,12 @@ func loadAllLegacyWatchlists() (*Config, []string, error) {
 			}
 			return nil, nil, fmt.Errorf("stat legacy watchlist %s: %w", path, err)
 		}
-		found = append(found, path)
 		cfg, err := Load(path)
 		if err != nil {
-			return nil, nil, fmt.Errorf("import legacy watchlist %s: %w", path, err)
+			log.Printf("watch: skipping malformed legacy watchlist %s: %v", path, err)
+			continue
 		}
+		found = append(found, path)
 		if merged == nil {
 			merged = &Config{PollInterval: cfg.PollInterval, OutputDir: cfg.OutputDir, Workers: cfg.Workers}
 		}

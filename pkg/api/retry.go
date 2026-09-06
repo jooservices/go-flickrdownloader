@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -71,6 +73,71 @@ type rateLimitedError struct {
 
 func (e *rateLimitedError) Error() string {
 	return fmt.Sprintf("flickr rate limit [%d]: %s", e.code, e.message)
+}
+
+// httpStatusError marks a Flickr REST response whose HTTP status itself (as
+// opposed to the JSON body isRateLimitResponse inspects) signals the
+// outcome: a transport-level 429/5xx from Flickr's edge, or an ordinary
+// 4xx failure. signedGet returns this instead of a plain error so
+// signedGetWithRetry can tell a transient status worth retrying from a
+// fatal one, and honor a Retry-After header when the server sent one.
+type httpStatusError struct {
+	status        int
+	body          []byte
+	retryAfter    time.Duration
+	hasRetryAfter bool
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("flickr api error %d: %s", e.status, string(e.body))
+}
+
+// isRetryableHTTPStatus reports whether an HTTP status returned by Flickr's
+// REST endpoint itself signals a transient condition worth retrying: 429 Too
+// Many Requests, 408 Request Timeout, or a 5xx server error. This is
+// distinct from isRateLimitResponse, which classifies Flickr's usual
+// convention of returning HTTP 200 with a JSON stat=fail/code=429 envelope —
+// a real non-200 status (an edge/WAF throttle, or a transient outage) never
+// reaches that check because the body isn't Flickr's REST envelope at all.
+func isRetryableHTTPStatus(status int) bool {
+	return status == http.StatusTooManyRequests ||
+		status == http.StatusRequestTimeout ||
+		(status >= http.StatusInternalServerError && status < 600)
+}
+
+// maxHTTPRetryAfter caps a parsed Retry-After header, matching the cap
+// rateLimitBackoff already applies to its own computed backoff.
+const maxHTTPRetryAfter = 60 * time.Second
+
+// parseRetryAfter parses a Retry-After header value — delta-seconds or an
+// HTTP-date — capped at maxHTTPRetryAfter. Duplicated from pkg/download's
+// copy rather than shared: pkg/api sits below pkg/download in the module's
+// layering (cmd -> pkg/{api,config,download,...}), so api must not import
+// download.
+func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(v, 10, 64); err == nil && seconds >= 0 {
+		d := time.Duration(seconds) * time.Second
+		if d > maxHTTPRetryAfter {
+			return maxHTTPRetryAfter, true
+		}
+		return d, true
+	}
+	when, err := http.ParseTime(v)
+	if err != nil {
+		return 0, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		return 0, false
+	}
+	if delay > maxHTTPRetryAfter {
+		return maxHTTPRetryAfter, true
+	}
+	return delay, true
 }
 
 // defaultRetrySleep is the production retrySleep: a context-aware timer.

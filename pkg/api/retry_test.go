@@ -1,9 +1,66 @@
 package api
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
+
+func TestIsRetryableHTTPStatus(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool
+	}{
+		{200, false},
+		{400, false},
+		{401, false},
+		{403, false},
+		{404, false},
+		{408, true},
+		{429, true},
+		{500, true},
+		{502, true},
+		{503, true},
+		{504, true},
+		{599, true},
+		{600, false},
+	}
+	for _, c := range cases {
+		if got := isRetryableHTTPStatus(c.status); got != c.want {
+			t.Errorf("isRetryableHTTPStatus(%d) = %v, want %v", c.status, got, c.want)
+		}
+	}
+}
+
+func TestAPIParseRetryAfter(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name  string
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{"empty", "", 0, false},
+		{"seconds", "5", 5 * time.Second, true},
+		{"zero seconds", "0", 0, true},
+		{"negative rejected", "-1", 0, false},
+		{"over cap clamps", "3600", maxHTTPRetryAfter, true},
+		{"garbage rejected", "not-a-number", 0, false},
+		{"http date in future", now.Add(10 * time.Second).Format(http.TimeFormat), 10 * time.Second, true},
+		{"http date in past rejected", now.Add(-10 * time.Second).Format(http.TimeFormat), 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseRetryAfter(c.value, now)
+			if ok != c.ok {
+				t.Fatalf("parseRetryAfter(%q) ok = %v, want %v", c.value, ok, c.ok)
+			}
+			if ok && got != c.want {
+				t.Fatalf("parseRetryAfter(%q) = %v, want %v", c.value, got, c.want)
+			}
+		})
+	}
+}
 
 // TestRateLimitBackoffCapsEvenAtHighAttempts is a regression test for a
 // backoff overflow: computing 1<<attempt before checking the 60s cap let a

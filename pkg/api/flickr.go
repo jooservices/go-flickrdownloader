@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -281,18 +282,41 @@ func (c *Client) apiGet(ctx context.Context, method string, params map[string]st
 	return v.([]byte), nil
 }
 
-// signedGetWithRetry retries a Flickr-side rate limit (JSON stat=fail,
-// code=429, or a rate/limit message) with capped exponential backoff,
-// unbounded in count — only context cancellation stops it. This lets a
-// long-running watch process wait through rate limiting instead of failing,
-// even when the proactive hourly tracker didn't catch it (e.g. a key shared
-// across machines).
+// signedGetWithRetry retries a Flickr-side rate limit with capped
+// exponential backoff, unbounded in count — only context cancellation stops
+// it. This lets a long-running watch process wait through rate limiting
+// instead of failing, even when the proactive hourly tracker didn't catch it
+// (e.g. a key shared across machines). Two distinct signals are retried:
+//
+//   - Flickr's usual convention: HTTP 200 with a JSON stat=fail/code=429 (or
+//     a rate/limit message) body — detected by isRateLimitResponse.
+//   - A transport-level 429/408/5xx status code itself — an edge/WAF throttle
+//     or a transient outage in front of Flickr, which never produces
+//     Flickr's REST envelope at all and so would otherwise bypass
+//     isRateLimitResponse entirely and surface as an immediate hard failure.
+//     A Retry-After header on that response, when present, overrides the
+//     computed backoff.
+//
+// A fatal (non-retryable) HTTP status, or any other transport error, is
+// returned immediately without a retry.
 func (c *Client) signedGetWithRetry(ctx context.Context, params map[string]string) ([]byte, error) {
 	attempt := 0
 	for {
 		body, err := c.signedGet(c.APIKey, c.APISecret, c.AccessToken, c.AccessSecret, baseURL, params)
 		if err != nil {
-			return nil, err
+			var hse *httpStatusError
+			if !errors.As(err, &hse) || !isRetryableHTTPStatus(hse.status) {
+				return nil, err
+			}
+			d := rateLimitBackoff(attempt, c.jitter())
+			if hse.hasRetryAfter {
+				d = hse.retryAfter
+			}
+			if err := c.sleep(ctx, d); err != nil {
+				return nil, fmt.Errorf("rate limited, retry cancelled: %w", err)
+			}
+			attempt++
+			continue
 		}
 		if !isRateLimitResponse(body) {
 			return body, nil

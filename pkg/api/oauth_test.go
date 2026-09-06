@@ -4,7 +4,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestRFC3986EscapeSpaceIsPercent20(t *testing.T) {
@@ -46,5 +50,74 @@ func TestBuildSignatureEncodesSpaceAsPercent20(t *testing.T) {
 
 	if got != want {
 		t.Fatalf("buildSignature = %q, want %q (expected base string %q)", got, want, wantBaseStr)
+	}
+}
+
+// TestSignedGetReturnsHTTPStatusErrorOnNon200 is a regression test for the
+// gap where a real (transport-level) non-200 response from Flickr's REST
+// endpoint produced a plain, unclassified error — invisible to the retry
+// loop's rate-limit detection, which only ever inspected the JSON body of an
+// HTTP-200 response. SignedGet must now return a typed *httpStatusError so
+// the caller can tell a transient status (429/5xx) from a fatal one.
+func TestSignedGetReturnsHTTPStatusErrorOnNon200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("Too Many Requests"))
+	}))
+	defer srv.Close()
+
+	_, err := SignedGet("key", "secret", "token", "token-secret", srv.URL, nil)
+	if err == nil {
+		t.Fatal("expected an error for a 429 response")
+	}
+	var hse *httpStatusError
+	if !errors.As(err, &hse) {
+		t.Fatalf("expected *httpStatusError, got %T: %v", err, err)
+	}
+	if hse.status != http.StatusTooManyRequests {
+		t.Fatalf("hse.status = %d, want %d", hse.status, http.StatusTooManyRequests)
+	}
+	if hse.hasRetryAfter {
+		t.Fatalf("hasRetryAfter = true with no Retry-After header sent")
+	}
+}
+
+// TestSignedGetParsesRetryAfterHeader checks the Retry-After header on a
+// non-200 response is parsed into the returned error.
+func TestSignedGetParsesRetryAfterHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("try later"))
+	}))
+	defer srv.Close()
+
+	_, err := SignedGet("key", "secret", "token", "token-secret", srv.URL, nil)
+	var hse *httpStatusError
+	if !errors.As(err, &hse) {
+		t.Fatalf("expected *httpStatusError, got %T: %v", err, err)
+	}
+	if !hse.hasRetryAfter || hse.retryAfter != 7*time.Second {
+		t.Fatalf("retryAfter = %v (hasRetryAfter=%v), want 7s", hse.retryAfter, hse.hasRetryAfter)
+	}
+}
+
+// TestSignedGetSetsUserAgent guards against reverting to the Go default
+// User-Agent, which some edges/WAFs throttle more aggressively than a named
+// client.
+func TestSignedGetSetsUserAgent(t *testing.T) {
+	var gotUA string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"stat":"ok"}`))
+	}))
+	defer srv.Close()
+
+	if _, err := SignedGet("key", "secret", "token", "token-secret", srv.URL, nil); err != nil {
+		t.Fatalf("SignedGet: %v", err)
+	}
+	if gotUA != userAgent {
+		t.Fatalf("User-Agent = %q, want %q", gotUA, userAgent)
 	}
 }

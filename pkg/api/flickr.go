@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"strings"
@@ -315,29 +316,39 @@ func (c *Client) signedGetWithRetry(ctx context.Context, params map[string]strin
 	attempt := 0
 	for {
 		body, err := c.signedGet(c.APIKey, c.APISecret, c.AccessToken, c.AccessSecret, c.restBaseURL, params)
+
+		// Both retry signals (a transport-level 429/5xx, and Flickr's usual
+		// HTTP-200-with-JSON-stat=fail/code=429 convention) fall through to
+		// the same wait-and-retry tail below, rather than each duplicating
+		// their own copy of the backoff/sleep/attempt-increment sequence —
+		// a future change to that sequence (a max-attempts cap, a different
+		// cancellation message) previously risked being applied to only one
+		// of the two paths.
+		var retryAfter time.Duration
+		hasRetryAfter := false
 		if err != nil {
 			var hse *httpStatusError
 			if !errors.As(err, &hse) || !isRetryableHTTPStatus(hse.status) {
 				return nil, err
 			}
-			d := rateLimitBackoff(attempt, c.jitter())
-			if hse.hasRetryAfter {
-				d = hse.retryAfter
-			}
-			if err := c.sleep(ctx, d); err != nil {
-				return nil, fmt.Errorf("rate limited, retry cancelled: %w", err)
-			}
-			attempt++
-			continue
-		}
-		if !isRateLimitResponse(body) {
+			retryAfter, hasRetryAfter = hse.retryAfter, hse.hasRetryAfter
+		} else if !isRateLimitResponse(body) {
 			return body, nil
 		}
+
 		d := rateLimitBackoff(attempt, c.jitter())
+		if hasRetryAfter {
+			d = retryAfter
+		}
+		attempt++
+		// Retries are unbounded in count (by design, so a long-running
+		// watch process waits through an hours-long outage instead of
+		// failing) — log each one so that wait is visible progress, not a
+		// silent hang indistinguishable from the process being stuck.
+		log.Printf("flickr: rate limited, waiting %s before retry %d", d.Round(time.Second), attempt)
 		if err := c.sleep(ctx, d); err != nil {
 			return nil, fmt.Errorf("rate limited, retry cancelled: %w", err)
 		}
-		attempt++
 	}
 }
 

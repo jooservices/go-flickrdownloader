@@ -1,6 +1,8 @@
-// Package watch implements the long-running watchlist feature: a watchlist
-// file (YAML or plain text) of Flickr URLs that are re-downloaded on an
-// interval, waiting through quota exhaustion instead of failing.
+// Package watch implements the long-running watchlist feature: Flickr URLs
+// that are re-downloaded on an interval, waiting through quota exhaustion
+// instead of failing. The default store is the account cache database; YAML
+// and plain-text files remain the --file escape hatch and the one-time
+// legacy import format.
 package watch
 
 import (
@@ -24,6 +26,7 @@ type Source struct {
 	PollInterval   time.Duration
 	OutputDir      string
 	Workers        int
+	Enabled        bool // false sources are skipped by the scheduler
 }
 
 // Config is a parsed watchlist file.
@@ -34,8 +37,8 @@ type Config struct {
 	Sources      []Source
 }
 
-// DefaultPaths returns the watchlist paths probed in order when no --file is
-// given: the YAML file first, then the plain-text fallback.
+// DefaultPaths returns the legacy watchlist paths probed in order during
+// one-time import: the YAML file first, then the plain-text fallback.
 func DefaultPaths() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -118,6 +121,7 @@ func normalizeSource(s rawSource, cfg *Config) (Source, error) {
 		PollInterval: s.PollInterval,
 		OutputDir:    s.OutputDir,
 		Workers:      s.Workers,
+		Enabled:      true,
 	}
 	if s.Uncategorized == nil {
 		src.IncludeOrphans = true
@@ -161,6 +165,7 @@ func loadText(path string) (*Config, error) {
 			URL:            text,
 			Albums:         "all",
 			IncludeOrphans: true,
+			Enabled:        true,
 		})
 	}
 	if err := sc.Err(); err != nil {

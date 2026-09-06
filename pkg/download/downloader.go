@@ -95,6 +95,8 @@ type Downloader struct {
 	// Per-album results for the final breakdown table.
 	albumStats []ui.AlbumStat
 	statsMu    sync.Mutex
+
+	failMu sync.Mutex
 }
 
 var (
@@ -235,6 +237,26 @@ func (d *Downloader) indexLocalFiles(dir string) error {
 		return err
 	}
 	return nil
+}
+
+func (d *Downloader) noteLocalFile(id, path string) {
+	abs := absolutePath(path)
+	parent := filepath.Dir(abs)
+	d.localFilesMu.Lock()
+	defer d.localFilesMu.Unlock()
+	if d.localFiles == nil {
+		d.localFiles = make(map[string]string)
+	}
+	if d.localByDir == nil {
+		d.localByDir = make(map[string]map[string]string)
+	}
+	if d.localByDir[parent] == nil {
+		d.localByDir[parent] = make(map[string]string)
+	}
+	d.localByDir[parent][id] = abs
+	if _, exists := d.localFiles[id]; !exists {
+		d.localFiles[id] = abs
+	}
 }
 
 // missingPhotosetIDs returns the subset of expected not present as an
@@ -611,6 +633,7 @@ func (d *Downloader) AlbumStats() []ui.AlbumStat {
 
 func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 	if d.alreadyDownloaded(photo.ID) {
+		d.recordPhotoSuccess(photo.ID)
 		d.progress.AddSkipped()
 		return
 	}
@@ -631,6 +654,8 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 	if ok {
 		target := filepath.Join(d.OutDir, photo.ID+filepath.Ext(existing))
 		if err := os.Link(existing, target); err == nil {
+			d.noteLocalFile(photo.ID, target)
+			d.recordPhotoSuccess(photo.ID)
 			d.progress.AddLinked()
 			return
 		}
@@ -638,7 +663,7 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 
 	downloadURL, ext, err := d.resolveDownloadURL(ctx, photo)
 	if err != nil {
-		d.progress.AddFailure(photo.ID, "", err.Error())
+		d.recordPhotoFailure(photo.ID, "", err.Error())
 		return
 	}
 
@@ -650,7 +675,7 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 	n, err := d.downloadFile(ctx, downloadURL, filePath)
 	if err != nil {
 		if !errors.Is(err, errCancelled) {
-			d.progress.AddFailure(photo.ID, downloadURL, err.Error())
+			d.recordPhotoFailure(photo.ID, downloadURL, err.Error())
 		}
 		return
 	}
@@ -658,6 +683,8 @@ func (d *Downloader) worker(ctx context.Context, photo api.Photo) {
 	d.pathMu.Lock()
 	d.downloadedPaths[photo.ID] = filePath
 	d.pathMu.Unlock()
+	d.noteLocalFile(photo.ID, filePath)
+	d.recordPhotoSuccess(photo.ID)
 
 	d.progress.AddSuccess()
 	d.progress.AddBytes(n)
@@ -914,6 +941,7 @@ type UserDownloadOptions struct {
 }
 
 func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts UserDownloadOptions) (Stats, error) {
+	d.RetryFailedFirst(ctx)
 	userDir := filepath.Join(d.OutDir, userID)
 
 	sets := opts.Sets
@@ -1077,6 +1105,7 @@ func (d *Downloader) DownloadByUser(ctx context.Context, userID string, opts Use
 }
 
 func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) (Stats, error) {
+	d.RetryFailedFirst(ctx)
 	info, infoErr := d.Client.GetPhotosetInfo(ctx, photosetID)
 	ownerNSID := ""
 	setName := photosetID
@@ -1146,6 +1175,7 @@ func (d *Downloader) DownloadByPhotoset(ctx context.Context, photosetID string) 
 }
 
 func (d *Downloader) DownloadPhoto(ctx context.Context, photoID string) error {
+	d.RetryFailedFirst(ctx)
 	info, err := d.Client.GetPhotoInfo(ctx, photoID)
 	if err != nil {
 		return fmt.Errorf("get photo info: %w", err)

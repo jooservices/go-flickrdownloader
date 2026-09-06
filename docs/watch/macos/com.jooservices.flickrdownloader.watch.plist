@@ -2,6 +2,9 @@
 <!--
   launchd agent for `flickrdownloader watch`.
 
+  Requires `flickrdownloader auth` and at least one `watch add` (or a
+  watchlist.yaml / sources.txt that will be imported once on first run).
+
   Install:
     mkdir -p ~/.local/state/flickrdownloader
     cp com.jooservices.flickrdownloader.watch.plist ~/Library/LaunchAgents/

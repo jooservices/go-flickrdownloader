@@ -1,6 +1,6 @@
 # Implementation summary — Robust downloads
 
-**Feature:** `robust-downloads` · **Package:** `pkg/download` · **Status:** implemented (TASK-001…TASK-006 code; TASK-007 shared memory)
+**Feature:** `robust-downloads` · **Package:** `pkg/download` · **Status:** implemented
 
 ## What was built
 
@@ -57,7 +57,7 @@ HTTP **416** is a **signal**, not an outcome (explicit branch in `rangeGet`).
 
 ### ADRs
 
-See `docs/architecture/ADR-001.md` … `ADR-014.md` (fetcher value type; sleeper/jitter; end-of-album sweep; parent-ctx cancellation; client timeout location; read/write split; `allowIDAbsentSweep`; 416 branch; validate/promote errors; length sentinel; ingest extraction; rangeGet classification; best-effort promote cleanup; read-error short-circuit).
+See `docs/architecture/ADR-001.md` … `ADR-014.md` (fetcher value type; sleeper/jitter; end-of-album sweep; parent-ctx cancellation; client timeout location; read/write split; `allowIDAbsentSweep`; 416 branch; validate/promote errors; length sentinel; ingest extraction; rangeGet classification; best-effort promote cleanup; read-error short-circuit). Output-root locking and local reuse: `docs/architecture/ADR-023.md`.
 
 ## Per-task AC mapping (summary)
 
@@ -68,13 +68,12 @@ See `docs/architecture/ADR-001.md` … `ADR-014.md` (fetcher value type; sleeper
 | Range resume & gates | AC-007, AC-008, AC-009, AC-010, AC-011 |
 | Candidate / 416 / promote | AC-012, AC-013, AC-019, AC-020 |
 | Album sweep scope | AC-017, AC-018 |
-| Shared memory / README | AC-003 & AC-017 documented; known limitations; ADR-001…014 |
+| README / known limitations | AC-003 & AC-017 documented; ADR-001…014, ADR-023 |
 
-Exact task YAML IDs live under `.ai/tasks/`; this table is the reuse map for reviewers and future features touching `pkg/download`.
+This table is the reuse map for reviewers and future features touching `pkg/download`.
 
 ## Notes for future work
 
 - Extension-change orphaning of `{id}.{old-ext}.part` remains a known limitation (document in README).
-- Concurrent CLI instances on one tree are unsupported.
+- Concurrent CLI instances on one tree are serialized by the output-root lock (ADR-023); a second process is rejected rather than racing.
 - Legacy `.tmp` is never resumed; a one-shot migrator could delete or rename them if needed.
-- No CLI flags or API surface changes were introduced; further hardening (checksums, multi-process locking) would be a new feature.

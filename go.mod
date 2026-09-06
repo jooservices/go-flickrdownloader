@@ -1,6 +1,6 @@
-module github.com/jooservices/flickrdownloader
+module github.com/jooservices/go-flickrdownloader
 
-go 1.25.0
+go 1.25.13
 
 require (
 	github.com/gofrs/flock v0.13.0

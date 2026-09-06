@@ -3,7 +3,7 @@ package download
 import (
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 func TestEstimatePhotoBytes(t *testing.T) {

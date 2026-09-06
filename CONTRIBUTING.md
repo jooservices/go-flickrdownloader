@@ -5,7 +5,7 @@ Thanks for helping improve flickrdownloader.
 ## Development setup
 
 ```bash
-git clone https://github.com/jooservices/flickrdownloader.git
+git clone https://github.com/jooservices/go-flickrdownloader.git
 cd flickrdownloader
 go test -race ./...
 ```
@@ -31,4 +31,4 @@ Use concise messages focused on **why** the change is needed, in the style of th
 
 - Keep diffs focused — one logical change per PR when possible.
 - Include a short test plan if behavior is user-visible.
-- CI must pass (`test` workflow: vet, race tests, govulncheck).
+- CI must pass (`test` workflow: gofmt, vet, race tests, govulncheck, Windows cross-build).

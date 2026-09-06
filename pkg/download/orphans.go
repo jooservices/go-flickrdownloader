@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 // orphanMembershipScope describes which albums determine whether a photo counts

@@ -205,39 +205,7 @@ func (p *Progress) Summary() string {
 	p.stats.mu.Unlock()
 
 	if len(failures) > 0 {
-		b.WriteString(fmt.Sprintf("\n\n  %s%s %d failed photo(s):%s\n", ColorRed, IconErr, len(failures), ColorReset))
-
-		// Group failures by error message so a repeated cause collapses into
-		// one line instead of a wall of identical entries.
-		type group struct {
-			count int
-			ids   []string
-		}
-		groups := map[string]*group{}
-		var order []string
-		for _, f := range failures {
-			g, ok := groups[f.Err]
-			if !ok {
-				g = &group{}
-				groups[f.Err] = g
-				order = append(order, f.Err)
-			}
-			g.count++
-			g.ids = append(g.ids, f.ID)
-		}
-		for _, msg := range order {
-			g := groups[msg]
-			b.WriteString(fmt.Sprintf("    %s✗ %d×%s %s%s\n",
-				ColorDim, g.count, ColorBold, msg, ColorReset))
-			const maxIDs = 8
-			if len(g.ids) <= maxIDs {
-				b.WriteString(fmt.Sprintf("      %sphotos: %s%s\n",
-					ColorDim, strings.Join(g.ids, ", "), ColorReset))
-			} else {
-				b.WriteString(fmt.Sprintf("      %sphotos: %s … +%d more%s\n",
-					ColorDim, strings.Join(g.ids[:maxIDs], ", "), len(g.ids)-maxIDs, ColorReset))
-			}
-		}
+		b.WriteString(FormatFailures(failures))
 	}
 
 	spd := p.speed()
@@ -246,6 +214,46 @@ func (p *Progress) Summary() string {
 	}
 
 	b.WriteString("\n")
+	return b.String()
+}
+
+// FormatFailures groups photo failures by error so a repeated cause is one
+// line with photo IDs, instead of a wall of identical entries.
+func FormatFailures(failures []FailEntry) string {
+	if len(failures) == 0 {
+		return ""
+	}
+	type group struct {
+		count int
+		ids   []string
+	}
+	groups := map[string]*group{}
+	var order []string
+	for _, f := range failures {
+		g, ok := groups[f.Err]
+		if !ok {
+			g = &group{}
+			groups[f.Err] = g
+			order = append(order, f.Err)
+		}
+		g.count++
+		g.ids = append(g.ids, f.ID)
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("\n  %s%s %d failed photo(s):%s\n", ColorRed, IconErr, len(failures), ColorReset))
+	for _, msg := range order {
+		g := groups[msg]
+		b.WriteString(fmt.Sprintf("    %s✗ %d×%s %s%s\n",
+			ColorDim, g.count, ColorBold, msg, ColorReset))
+		const maxIDs = 8
+		if len(g.ids) <= maxIDs {
+			b.WriteString(fmt.Sprintf("      %sphotos: %s%s\n",
+				ColorDim, strings.Join(g.ids, ", "), ColorReset))
+		} else {
+			b.WriteString(fmt.Sprintf("      %sphotos: %s … +%d more%s\n",
+				ColorDim, strings.Join(g.ids[:maxIDs], ", "), len(g.ids)-maxIDs, ColorReset))
+		}
+	}
 	return b.String()
 }
 

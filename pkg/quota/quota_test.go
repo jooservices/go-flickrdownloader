@@ -708,3 +708,125 @@ func TestReplaceFileLeavesDestWhenOpen(t *testing.T) {
 		t.Fatalf("dest mutated while open: %q", data)
 	}
 }
+
+func TestUsageReflectsSnapshot(t *testing.T) {
+	tk, _, _ := newTestTracker(t, 2)
+	if used, limit, _ := tk.Usage(); used != 0 || limit != 2 {
+		t.Fatalf("Usage = %d/%d, want 0/2", used, limit)
+	}
+	if err := tk.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if used, limit, _ := tk.Usage(); used != 1 || limit != 2 {
+		t.Fatalf("Usage = %d/%d, want 1/2", used, limit)
+	}
+}
+
+// TestTrimLockedDropsExpiredEntriesInMemoryOnly covers trimLocked, the
+// non-persisted counterpart to rawLoadLocked's file-backed trimming: a
+// Tracker built with an empty path (in-memory only) still has to expire old
+// entries out of its rolling window, just without a log to re-read.
+func TestTrimLockedDropsExpiredEntriesInMemoryOnly(t *testing.T) {
+	clock := newFakeClock(time.Now())
+	tk, err := New("", 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Now = clock.Now
+	tk.Sleep = clock.Sleep
+	ctx := context.Background()
+	if err := tk.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The cap (2) is now reached. Advance the clock past the rolling
+	// window so trimLocked drops both entries on the next attempt, rather
+	// than blocking.
+	clock.advance(time.Hour + time.Second)
+	if err := tk.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	used, _, _ := tk.Usage()
+	if used != 1 {
+		t.Fatalf("used = %d, want 1 (two expired entries trimmed, one fresh recorded)", used)
+	}
+}
+
+func TestSleepWithUsesRealTimerWhenNoSleepInjected(t *testing.T) {
+	tk := &Tracker{Now: time.Now}
+	start := time.Now()
+	if err := tk.sleepWith(context.Background(), 10*time.Millisecond); err != nil {
+		t.Fatalf("sleepWith: %v", err)
+	}
+	if time.Since(start) < 10*time.Millisecond {
+		t.Fatal("sleepWith returned before the requested duration elapsed")
+	}
+}
+
+func TestSleepWithRealTimerRespectsCancellation(t *testing.T) {
+	tk := &Tracker{Now: time.Now}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := tk.sleepWith(ctx, time.Hour); err == nil {
+		t.Fatal("expected an error when the context is already cancelled")
+	}
+}
+
+func TestFlushLockedFailsWhenDirMissing(t *testing.T) {
+	tk := newTracker(filepath.Join(t.TempDir(), "missing-dir", "quota.log"), 0, 0)
+	tk.entries = []int64{time.Now().Unix()}
+	if err := tk.flushLocked(); err == nil {
+		t.Fatal("expected an error when the log's directory doesn't exist")
+	}
+}
+
+func TestCompactLockedFailsWhenDirMissing(t *testing.T) {
+	tk := newTracker(filepath.Join(t.TempDir(), "missing-dir", "quota.log"), 0, 0)
+	tk.entries = []int64{time.Now().Unix()}
+	if err := tk.compactLocked(); err == nil {
+		t.Fatal("expected an error when the log's directory doesn't exist")
+	}
+}
+
+func TestNewFailsWhenLogUnreadable(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root: file permissions don't block reads")
+	}
+	path := filepath.Join(t.TempDir(), "quota.log")
+	if err := os.WriteFile(path, []byte("123\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path, 0, 0); err == nil {
+		t.Fatal("expected an error when the log file is unreadable")
+	}
+}
+
+func TestCompactLockedFailsWhenReplaceFails(t *testing.T) {
+	tk := newTracker(filepath.Join(t.TempDir(), "quota.log"), 0, 0)
+	tk.entries = []int64{time.Now().Unix()}
+	tk.replaceFile = func(tmp, dest string) error { return fmt.Errorf("boom") }
+	if err := tk.compactLocked(); err == nil {
+		t.Fatal("expected an error when replaceFile fails")
+	}
+}
+
+func TestFlushPropagatesFlushLockedFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "quota.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tk, err := New(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.entries = append(tk.entries, time.Now().Unix()) // unflushed
+	if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.Flush(); err == nil {
+		t.Fatal("expected Flush to propagate a flushLocked failure")
+	}
+}

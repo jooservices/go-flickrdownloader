@@ -1229,3 +1229,66 @@ func TestFetch_CancellationC13(t *testing.T) {
 		assertSleeps(t, sleep)
 	})
 }
+
+func TestRetryAfterErrorMessage(t *testing.T) {
+	err := retryAfterError{delay: 7 * time.Second}
+	if got, want := err.Error(), "retry after 7s"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}
+
+func TestFetcherJitterValueDefaultsToZero(t *testing.T) {
+	f := fetcher{}
+	if got := f.jitterValue(); got != 0 {
+		t.Fatalf("jitterValue with no jitter func = %v, want 0", got)
+	}
+	f.jitter = func() float64 { return 0.5 }
+	if got := f.jitterValue(); got != 0.5 {
+		t.Fatalf("jitterValue = %v, want 0.5", got)
+	}
+}
+
+func TestFetcherSleepWithUsesRealTimerWhenNoSleepInjected(t *testing.T) {
+	f := fetcher{}
+	start := time.Now()
+	if err := f.sleepWith(context.Background(), 10*time.Millisecond); err != nil {
+		t.Fatalf("sleepWith: %v", err)
+	}
+	if time.Since(start) < 10*time.Millisecond {
+		t.Fatal("sleepWith returned before the requested duration elapsed")
+	}
+}
+
+func TestFetcherSleepWithRealTimerRespectsCancellation(t *testing.T) {
+	f := fetcher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.sleepWith(ctx, time.Hour); err == nil {
+		t.Fatal("expected an error when the context is already cancelled")
+	}
+}
+
+func TestNewDownloadHTTPClientCheckRedirect(t *testing.T) {
+	client := newDownloadHTTPClient()
+	req, err := http.NewRequest("GET", "https://live.staticflickr.com/x.jpg", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	via := make([]*http.Request, 10)
+	if err := client.CheckRedirect(req, via); err == nil {
+		t.Fatal("expected an error after 10 redirects")
+	}
+
+	bad, err := http.NewRequest("GET", "https://evil.example/x.jpg", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CheckRedirect(bad, nil); err == nil {
+		t.Fatal("expected an error redirecting to a non-Flickr host")
+	}
+
+	if err := client.CheckRedirect(req, nil); err != nil {
+		t.Fatalf("expected a Flickr CDN redirect to be allowed: %v", err)
+	}
+}

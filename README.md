@@ -26,14 +26,14 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 - Automatically discovers and mirrors a user's album structure on disk (photos not in any album land in an "uncategorized" folder)
 - `--dry-run` preview — album tree, photo counts and estimated total size before anything is downloaded
 - Concurrent downloads with a configurable worker pool
-- Resumable — already-downloaded files are skipped on re-run, regardless of file extension
+- Resumable — already-downloaded files are skipped on re-run, regardless of file extension. Failed photos print the reason, are logged in `.flickrdownloader.failures.jsonl` under the output root, and are retried first on the next `download` / `watch` start
 - **`scan`** — index an existing download tree into completion manifests (for archives made before 1.3.0)
 - Completion manifests — unchanged albums skip Flickr listing on the next `download` (`--refresh` / `--force` to re-check)
 - Cross-album dedupe — a photo present in several albums is downloaded once and hardlinked into the others
 - Enforces Flickr's **3600 requests/hour API quota across runs** — a persisted rolling window per API key pauses requests at the cap and shows usage, reset time and an API-cost estimate for each plan
 - Account-scoped **response cache** — repeat runs reuse cached listings instead of re-fetching them, with `--refresh` / `--offline` to control that explicitly
 - **`verify`** — check downloaded photos against completion manifests without downloading or hitting the API
-- **`watch`** — a long-running mode that polls a watchlist file and downloads new photos forever, waiting out quota/rate limits instead of exiting
+- **`watch`** — a long-running mode that polls a watchlist (stored in the account cache database, or a YAML file via `--file`) and downloads new photos forever, waiting out quota/rate limits instead of exiting
 - **Output-root lock** — safe to run `download`/`verify`/`watch`/`scan` concurrently against different output trees; a second process against the *same* tree is rejected instead of racing
 - Handles both photos and videos, always fetching the original quality available
 - Live progress bar with ETA and transfer speed
@@ -49,11 +49,11 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 
 ### Prebuilt binary (recommended)
 
-Download the archive for your platform from the [Releases page](https://github.com/jooservices/flickrdownloader/releases/latest), extract it, and put the `flickrdownloader` binary somewhere on your `PATH`.
+Download the archive for your platform from the [Releases page](https://github.com/jooservices/go-flickrdownloader/releases/latest), extract it, and put the `flickrdownloader` binary somewhere on your `PATH`.
 
 ```bash
 # Example: macOS (Apple Silicon)
-tar -xzf flickrdownloader_v1.0.0_darwin_arm64.tar.gz
+tar -xzf flickrdownloader_v1.5.0_darwin_arm64.tar.gz
 sudo mv flickrdownloader /usr/local/bin/
 ```
 
@@ -62,7 +62,7 @@ Binaries are provided for macOS (amd64/arm64), Linux (amd64/arm64), and Windows 
 ### Build from source
 
 ```bash
-git clone https://github.com/jooservices/flickrdownloader.git
+git clone https://github.com/jooservices/go-flickrdownloader.git
 cd flickrdownloader
 go build -o flickrdownloader ./cmd/flickrdownloader
 ```
@@ -70,7 +70,7 @@ go build -o flickrdownloader ./cmd/flickrdownloader
 Or install directly with Go:
 
 ```bash
-go install github.com/jooservices/flickrdownloader/cmd/flickrdownloader@latest
+go install github.com/jooservices/go-flickrdownloader/cmd/flickrdownloader@latest
 ```
 
 ## Quick start
@@ -213,12 +213,22 @@ flickrdownloader download -u https://www.flickr.com/photos/someuser/ -o ./photos
 ## Watch mode (continuous sync)
 
 ```bash
-flickrdownloader watch --file ~/.config/flickrdownloader/watchlist.yaml
+flickrdownloader watch add https://www.flickr.com/photos/alice/
+flickrdownloader watch list
+flickrdownloader watch
 ```
 
 Turns `flickrdownloader` into a persistent watcher: it polls a **watchlist** of Flickr URLs on an interval, downloads anything new, and keeps running until you stop it (Ctrl-C / SIGTERM) — waiting through quota exhaustion or a Flickr-side rate limit instead of exiting.
 
-**Watchlist file** — YAML (`~/.config/flickrdownloader/watchlist.yaml` by default) for per-source overrides:
+The default watchlist is stored in the account cache database (`~/.config/flickrdownloader/cache-*.db`) and is **per Flickr account**. `watch list`, `watch add`, and `watch remove` require `flickrdownloader auth`. `cache clear` / `cache prune` do not delete it. Existing `watchlist.yaml` / `sources.txt` files are imported once on the first DB-mode watch command and renamed to `*.migrated`.
+
+Pass `--file` to keep using a YAML or text watchlist instead of the database:
+
+```bash
+flickrdownloader watch --file ~/.config/flickrdownloader/watchlist.yaml
+```
+
+**Watchlist file** (`--file`) — YAML for per-source overrides:
 
 ```yaml
 poll_interval: 30m
@@ -239,8 +249,8 @@ https://www.flickr.com/photos/bob/albums/72177720123456789
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--file` | auto-detect (`watchlist.yaml`, then `sources.txt`) | Watchlist path |
-| `--poll-interval` | from the file, or `30m` | Time between full cycles |
+| `--file` | account cache database | Optional YAML/text watchlist path |
+| `--poll-interval` | from the watchlist (DB or `--file`), or `30m` | Time between full cycles |
 | `--out` | config default | Output directory |
 | `--workers` | config default | Worker count |
 | `--log-file` | — | Append log lines to this file in addition to stdout |
@@ -249,7 +259,7 @@ https://www.flickr.com/photos/bob/albums/72177720123456789
 A per-source error is logged and skipped — one bad URL never stops the daemon. `--quiet` output is one line per event, safe to `grep`/`awk`:
 
 ```
-2026-08-17T12:00:00Z INFO watch starting watchlist=/home/user/.config/flickrdownloader/watchlist.yaml
+2026-08-17T12:00:00Z INFO watch starting watchlist=db
 2026-08-17T12:00:04Z INFO source alice done in 4s
 ```
 
@@ -309,7 +319,7 @@ go vet ./...
 go test ./...
 
 # Build with a release version stamped in (used by --version and update)
-go build -ldflags "-X main.version=v1.4.0" -o flickrdownloader ./cmd/flickrdownloader
+go build -ldflags "-X main.version=v1.5.0" -o flickrdownloader ./cmd/flickrdownloader
 ```
 
 ## Robust downloads
@@ -326,7 +336,7 @@ After a **fully listed** per-album download, an ID-absent sweep removes stale `.
 - **Concurrent `download`/`verify`/`watch` processes against the *same* output directory** are rejected outright by an advisory lock, rather than allowed to race — run them against separate output trees instead. Concurrent runs against *different* trees, and shared API quota tracking across runs, both work as expected.
 - Legacy `{id}.{ext}.tmp` files from older versions are **never resumed**; they are ignored by skip detection and left on disk.
 
-Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update: `ADR-015.md` … `ADR-018.md`; response cache, manifests, and watch mode: `ADR-019.md` … `ADR-023.md`).
+Architecture decisions for this behavior are recorded in `docs/architecture/ADR-001.md` … `ADR-014.md` (API quota and self-update: `ADR-015.md` … `ADR-018.md`; response cache, manifests, and watch mode: `ADR-019.md` … `ADR-024.md`).
 
 ## License
 

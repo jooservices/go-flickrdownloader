@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"strings"
@@ -87,6 +89,11 @@ type Client struct {
 	offline         bool
 	group           singleflight.Group
 
+	// restBaseURL is the Flickr REST endpoint; defaults to baseURL and is
+	// only ever changed via SetBaseURL, by tests that need to point a real
+	// Client at a local httptest server instead of the live API.
+	restBaseURL string
+
 	// signedGet is overridden in tests to avoid real network calls.
 	signedGet func(apiKey, apiSecret, accessToken, accessSecret, uri string, queryParams map[string]string) ([]byte, error)
 	// sleep/jitter back the 429 retry loop; overridden in tests.
@@ -102,6 +109,7 @@ func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
 		AccessSecret:    accessSecret,
 		rateLimiter:     rate.NewLimiter(rate.Every(1050*time.Millisecond), 1),
 		cacheListingTTL: 24 * time.Hour,
+		restBaseURL:     baseURL,
 		signedGet:       SignedGet,
 		sleep:           defaultRetrySleep,
 		jitter:          func() float64 { return 0.1 * rand.Float64() },
@@ -111,6 +119,12 @@ func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
 // SetRateLimiter replaces the default ~1 req/sec pacing with a custom gate,
 // e.g. a persisted quota tracker enforcing Flickr's 3600/hour cap across runs.
 func (c *Client) SetRateLimiter(rl RateLimiter) { c.rateLimiter = rl }
+
+// SetBaseURL overrides the Flickr REST endpoint. Production code never calls
+// this — it exists so tests in other packages (which can't reach the
+// unexported signedGet hook this package's own tests use) can point a real
+// Client at a local httptest server instead of the live API.
+func (c *Client) SetBaseURL(url string) { c.restBaseURL = url }
 
 // SetResponseCache installs a persistent response cache. A nil cache (the
 // default) makes every request a live REST call, as before 1.3.0.
@@ -281,27 +295,60 @@ func (c *Client) apiGet(ctx context.Context, method string, params map[string]st
 	return v.([]byte), nil
 }
 
-// signedGetWithRetry retries a Flickr-side rate limit (JSON stat=fail,
-// code=429, or a rate/limit message) with capped exponential backoff,
-// unbounded in count — only context cancellation stops it. This lets a
-// long-running watch process wait through rate limiting instead of failing,
-// even when the proactive hourly tracker didn't catch it (e.g. a key shared
-// across machines).
+// signedGetWithRetry retries a Flickr-side rate limit with capped
+// exponential backoff, unbounded in count — only context cancellation stops
+// it. This lets a long-running watch process wait through rate limiting
+// instead of failing, even when the proactive hourly tracker didn't catch it
+// (e.g. a key shared across machines). Two distinct signals are retried:
+//
+//   - Flickr's usual convention: HTTP 200 with a JSON stat=fail/code=429 (or
+//     a rate/limit message) body — detected by isRateLimitResponse.
+//   - A transport-level 429/408/5xx status code itself — an edge/WAF throttle
+//     or a transient outage in front of Flickr, which never produces
+//     Flickr's REST envelope at all and so would otherwise bypass
+//     isRateLimitResponse entirely and surface as an immediate hard failure.
+//     A Retry-After header on that response, when present, overrides the
+//     computed backoff.
+//
+// A fatal (non-retryable) HTTP status, or any other transport error, is
+// returned immediately without a retry.
 func (c *Client) signedGetWithRetry(ctx context.Context, params map[string]string) ([]byte, error) {
 	attempt := 0
 	for {
-		body, err := c.signedGet(c.APIKey, c.APISecret, c.AccessToken, c.AccessSecret, baseURL, params)
+		body, err := c.signedGet(c.APIKey, c.APISecret, c.AccessToken, c.AccessSecret, c.restBaseURL, params)
+
+		// Both retry signals (a transport-level 429/5xx, and Flickr's usual
+		// HTTP-200-with-JSON-stat=fail/code=429 convention) fall through to
+		// the same wait-and-retry tail below, rather than each duplicating
+		// their own copy of the backoff/sleep/attempt-increment sequence —
+		// a future change to that sequence (a max-attempts cap, a different
+		// cancellation message) previously risked being applied to only one
+		// of the two paths.
+		var retryAfter time.Duration
+		hasRetryAfter := false
 		if err != nil {
-			return nil, err
-		}
-		if !isRateLimitResponse(body) {
+			var hse *httpStatusError
+			if !errors.As(err, &hse) || !isRetryableHTTPStatus(hse.status) {
+				return nil, err
+			}
+			retryAfter, hasRetryAfter = hse.retryAfter, hse.hasRetryAfter
+		} else if !isRateLimitResponse(body) {
 			return body, nil
 		}
+
 		d := rateLimitBackoff(attempt, c.jitter())
+		if hasRetryAfter {
+			d = retryAfter
+		}
+		attempt++
+		// Retries are unbounded in count (by design, so a long-running
+		// watch process waits through an hours-long outage instead of
+		// failing) — log each one so that wait is visible progress, not a
+		// silent hang indistinguishable from the process being stuck.
+		log.Printf("flickr: rate limited, waiting %s before retry %d", d.Round(time.Second), attempt)
 		if err := c.sleep(ctx, d); err != nil {
 			return nil, fmt.Errorf("rate limited, retry cancelled: %w", err)
 		}
-		attempt++
 	}
 }
 

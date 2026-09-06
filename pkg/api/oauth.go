@@ -16,11 +16,21 @@ import (
 )
 
 const (
-	requestTokenURL      = "https://www.flickr.com/services/oauth/request_token"
 	authorizeURL         = "https://www.flickr.com/services/oauth/authorize"
-	accessTokenURL       = "https://www.flickr.com/services/oauth/access_token"
 	oauthSignatureMethod = "HMAC-SHA1"
 	oauthVersion         = "1.0"
+	// userAgent identifies this client to Flickr; some edges/WAFs throttle
+	// the default Go-http-client/1.1 UA more aggressively than a named one.
+	userAgent = "flickrdownloader"
+)
+
+// requestTokenURL/accessTokenURL are vars (not const), like restBaseURL,
+// solely so tests can point GetRequestToken/GetAccessToken at a local
+// httptest server instead of the live API. Production code never changes
+// them.
+var (
+	requestTokenURL = "https://www.flickr.com/services/oauth/request_token"
+	accessTokenURL  = "https://www.flickr.com/services/oauth/access_token"
 )
 
 func hmacSHA1(key, data string) string {
@@ -113,6 +123,7 @@ func OAuthGet(apiKey, consumerSecret, tokenSecret, uri string, extra map[string]
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
+	req.Header.Set("User-Agent", userAgent)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -207,6 +218,7 @@ func SignedGet(apiKey, apiSecret, accessToken, accessSecret, uri string, queryPa
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
+	req.Header.Set("User-Agent", userAgent)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
@@ -221,7 +233,17 @@ func SignedGet(apiKey, apiSecret, accessToken, accessSecret, uri string, queryPa
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("flickr api error %d: %s", resp.StatusCode, string(body))
+		// A non-200 here is a transport-level failure (edge/WAF throttle,
+		// transient 5xx) rather than Flickr's usual HTTP-200-with-JSON-
+		// stat=fail convention isRateLimitResponse handles. Returning a
+		// typed httpStatusError (instead of a plain error) lets
+		// signedGetWithRetry tell a transient status worth retrying from a
+		// fatal one, and honor Retry-After when the server sent one.
+		hse := &httpStatusError{status: resp.StatusCode, body: body}
+		if d, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+			hse.retryAfter, hse.hasRetryAfter = d, true
+		}
+		return nil, hse
 	}
 
 	return body, nil

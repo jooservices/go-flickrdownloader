@@ -160,7 +160,7 @@ func Install(ctx context.Context, rel *Release, a *Asset) error {
 		return err
 	}
 
-	exe, err := os.Executable()
+	exe, err := executablePath()
 	if err != nil {
 		return fmt.Errorf("locate current binary: %w", err)
 	}
@@ -171,6 +171,11 @@ func Install(ctx context.Context, rel *Release, a *Asset) error {
 
 	return replaceExecutable(exe, binPath)
 }
+
+// executablePath indirects os.Executable so tests can drive Install
+// end-to-end against a throwaway file instead of the real test binary.
+// Production code never overrides it.
+var executablePath = os.Executable
 
 // replaceExecutable swaps binPath in for the running executable at exe. The
 // new binary is staged alongside exe first (exe+".new") — so a copy failure

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -430,5 +431,205 @@ func TestReplaceExecutableSwapAndRecoveryBothFail(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), exe+".old") || !strings.Contains(err.Error(), exe+".new") {
 		t.Fatalf("error = %v, want it to name both file locations for manual recovery", err)
+	}
+}
+
+// redirectTransport rewrites every outgoing request to target base instead
+// of its original host, so tests can point the package-level httpClient at
+// a local httptest server without changing LatestRelease's hardcoded
+// GitHub API URL.
+type redirectTransport struct{ base *url.URL }
+
+func (rt redirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.URL.Scheme = rt.base.Scheme
+	req.URL.Host = rt.base.Host
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+func withRedirectedHTTPClient(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := httpClient
+	t.Cleanup(func() { httpClient = orig })
+	httpClient = &http.Client{Transport: redirectTransport{base: u}}
+}
+
+func TestLatestRelease(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"tag_name":"v1.2.3","name":"v1.2.3","assets":[]}`))
+	}))
+	defer srv.Close()
+	withRedirectedHTTPClient(t, srv)
+
+	rel, err := LatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("LatestRelease: %v", err)
+	}
+	if rel.TagName != "v1.2.3" {
+		t.Fatalf("TagName = %q, want v1.2.3", rel.TagName)
+	}
+}
+
+func TestLatestReleaseNoReleasesYet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	withRedirectedHTTPClient(t, srv)
+
+	if _, err := LatestRelease(context.Background()); err == nil {
+		t.Fatal("expected an error for a 404 (no releases published yet)")
+	}
+}
+
+func TestLatestReleaseUnexpectedStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	withRedirectedHTTPClient(t, srv)
+
+	if _, err := LatestRelease(context.Background()); err == nil {
+		t.Fatal("expected an error for a 500 response")
+	}
+}
+
+func TestLatestReleaseRejectsMalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+	withRedirectedHTTPClient(t, srv)
+
+	if _, err := LatestRelease(context.Background()); err == nil {
+		t.Fatal("expected an error for malformed JSON")
+	}
+}
+
+// TestInstallEndToEnd drives Install through its full sequence — download,
+// checksum verification (via the asset's GitHub-computed digest), extract,
+// and the executable swap — against a throwaway "current binary" instead of
+// the real test binary, via executablePath's test seam.
+func TestInstallEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "release.tar.gz")
+	const binContent = "new binary contents"
+	assetName := fmt.Sprintf("flickrdownloader_%s_%s", runtime.GOOS, runtime.GOARCH)
+	writeTarGz(t, archivePath, map[string]string{assetName: binContent})
+
+	archiveBytes, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(archiveBytes)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(archiveBytes)
+	}))
+	defer srv.Close()
+
+	asset := &Asset{
+		Name:               assetName + ".tar.gz",
+		BrowserDownloadURL: srv.URL,
+		Size:               int64(len(archiveBytes)),
+		Digest:             digest,
+	}
+
+	exeDir := t.TempDir()
+	exe := filepath.Join(exeDir, "flickrdownloader")
+	if err := os.WriteFile(exe, []byte("old binary contents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origExecutablePath := executablePath
+	defer func() { executablePath = origExecutablePath }()
+	executablePath = func() (string, error) { return exe, nil }
+
+	if err := Install(context.Background(), &Release{}, asset); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != binContent {
+		t.Fatalf("exe content = %q, want %q", got, binContent)
+	}
+}
+
+func TestInstallPropagatesExecutablePathFailure(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "release.tar.gz")
+	assetName := fmt.Sprintf("flickrdownloader_%s_%s", runtime.GOOS, runtime.GOARCH)
+	writeTarGz(t, archivePath, map[string]string{assetName: "content"})
+	archiveBytes, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(archiveBytes)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(archiveBytes)
+	}))
+	defer srv.Close()
+
+	asset := &Asset{
+		Name: assetName + ".tar.gz", BrowserDownloadURL: srv.URL,
+		Size: int64(len(archiveBytes)), Digest: "sha256:" + hex.EncodeToString(sum[:]),
+	}
+
+	origExecutablePath := executablePath
+	defer func() { executablePath = origExecutablePath }()
+	executablePath = func() (string, error) { return "", fmt.Errorf("boom") }
+
+	if err := Install(context.Background(), &Release{}, asset); err == nil {
+		t.Fatal("expected Install to propagate an executablePath failure")
+	}
+}
+
+func TestInstallPropagatesChecksumMismatch(t *testing.T) {
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "release.tar.gz")
+	assetName := fmt.Sprintf("flickrdownloader_%s_%s", runtime.GOOS, runtime.GOARCH)
+	writeTarGz(t, archivePath, map[string]string{assetName: "content"})
+	archiveBytes, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(archiveBytes)
+	}))
+	defer srv.Close()
+
+	asset := &Asset{
+		Name: assetName + ".tar.gz", BrowserDownloadURL: srv.URL,
+		Size: int64(len(archiveBytes)), Digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+	}
+
+	if err := Install(context.Background(), &Release{}, asset); err == nil {
+		t.Fatal("expected Install to refuse a checksum mismatch")
+	}
+}
+
+func TestInstallPropagatesDownloadFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	asset := &Asset{Name: "asset.tar.gz", BrowserDownloadURL: srv.URL, Digest: "sha256:abcd"}
+	if err := Install(context.Background(), &Release{}, asset); err == nil {
+		t.Fatal("expected Install to propagate a download failure")
 	}
 }

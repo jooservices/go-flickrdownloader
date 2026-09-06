@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.6.0] - 2026-09-06
+
+### Changed
+
+- Project and module renamed from `flickrdownloader` to `go-flickrdownloader` (matches the `go-<name>` convention used by sibling Go CLIs). The repository moved to `github.com/jooservices/go-flickrdownloader`; the binary name, CLI command (`flickrdownloader`), and flags are unchanged. Update `go install` / clone paths and any `-X main.version` build scripts that reference the old import path.
+- REST client retries now unwrap transport-level HTTP status errors (429/408/5xx), not only Flickr's JSON rate-limit envelope, and log each wait so a long, quota-driven retry is visible instead of silent. This is the fix for `watch` failing to resume automatically after the Flickr API quota resets — it can now be left running unattended and will wait out both the API-level and HTTP-level limits and pick back up on its own.
+
+### Fixed
+
+- Retry-After parsing no longer overflows on a very large or malformed header value; it clamps to the same capped backoff used elsewhere instead of computing a negative duration.
+- Self-update no longer leaves an orphaned staged binary if a later step fails, and a failed `chmod` on the staged binary is a warning, not a fatal error.
+- Closed a permission window during cache database creation and fixed lease renewal.
+- Legacy watchlist migration no longer silently drops every file but the first, and a malformed legacy file is skipped (with a log line) instead of aborting the whole import.
+- Failed-download log cleanup no longer relies on a length-comparison proxy to detect a removed entry.
+
+### Tests
+
+- Coverage raised to 85%+ across `pkg/api`, `pkg/cache`, `pkg/config`, `pkg/download`, `pkg/quota`, `pkg/ui`, `pkg/update`, and `cmd/flickrdownloader`.
+- `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go test -race ./...` all clean.
+
 ## [1.5.0] - 2026-08-18
 
 ### Added

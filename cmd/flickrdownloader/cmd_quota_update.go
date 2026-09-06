@@ -6,9 +6,9 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/config"
-	"github.com/jooservices/flickrdownloader/pkg/ui"
-	"github.com/jooservices/flickrdownloader/pkg/update"
+	"github.com/jooservices/go-flickrdownloader/pkg/config"
+	"github.com/jooservices/go-flickrdownloader/pkg/ui"
+	"github.com/jooservices/go-flickrdownloader/pkg/update"
 	"github.com/spf13/cobra"
 )
 

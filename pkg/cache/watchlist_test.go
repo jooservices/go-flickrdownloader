@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 func TestOpenCreatesWatchlistSchemaV8(t *testing.T) {

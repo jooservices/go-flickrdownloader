@@ -21,7 +21,7 @@ import (
 
 const (
 	Owner   = "jooservices"
-	Repo    = "flickrdownloader"
+	Repo    = "go-flickrdownloader"
 	BinName = "flickrdownloader"
 )
 

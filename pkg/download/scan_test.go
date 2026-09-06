@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 func TestScanUserWritesCompleteManifest(t *testing.T) {

@@ -7,11 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/cache"
-	"github.com/jooservices/flickrdownloader/pkg/config"
-	"github.com/jooservices/flickrdownloader/pkg/download"
-	"github.com/jooservices/flickrdownloader/pkg/watch"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/config"
+	"github.com/jooservices/go-flickrdownloader/pkg/download"
+	"github.com/jooservices/go-flickrdownloader/pkg/watch"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )

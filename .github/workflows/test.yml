@@ -2,7 +2,7 @@ name: test
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [master, develop]
   pull_request:
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test -race ./...
+        run: go test -race -cover ./...
       - name: Govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest

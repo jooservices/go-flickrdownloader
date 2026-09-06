@@ -176,6 +176,17 @@ func (d *Downloader) clearFailure(id, rel string) {
 		}
 		out = append(out, rec)
 	}
+	if len(out) == len(recs) {
+		// Nothing was actually removed — this photo had no pending failure
+		// record (the common case: recordPhotoSuccess calls this on every
+		// successful download, not just ones that clear a real failure).
+		// Skip the mkdir+tempfile+write+rename (or, when recs is already
+		// empty, the os.Remove syscall) saveFailures would otherwise redo
+		// as a no-op, serialized under failMu, on every single successful
+		// photo whenever any failure record exists anywhere under the
+		// output root.
+		return
+	}
 	_ = d.saveFailures(out)
 }
 

@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -10,8 +11,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/flickrdownloader/pkg/cache"
 	"github.com/jooservices/flickrdownloader/pkg/ui"
 )
 
@@ -448,4 +451,97 @@ func TestCleanExtAllowlistAndHost(t *testing.T) {
 	if _, _, err := acceptDownloadURL("https://evil.example/x.jpg"); err == nil {
 		t.Fatal("expected non-Flickr download URL to be rejected")
 	}
+}
+
+func TestHTTPHint(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool // whether a non-empty hint is expected
+	}{
+		{http.StatusForbidden, true},
+		{http.StatusNotFound, true},
+		{http.StatusUnauthorized, true},
+		{http.StatusTooManyRequests, true},
+		{http.StatusInternalServerError, true},
+		{http.StatusBadGateway, true},
+		{http.StatusServiceUnavailable, true},
+		{http.StatusTeapot, false},
+	}
+	for _, c := range cases {
+		got := httpHint(c.status)
+		if (got != "") != c.want {
+			t.Errorf("httpHint(%d) = %q, want non-empty=%v", c.status, got, c.want)
+		}
+	}
+}
+
+func TestAlbumStatsReturnsIndependentCopy(t *testing.T) {
+	root := t.TempDir()
+	d := New(nil, root, 1)
+	d.recordAlbum("Album A", ui.NewProgress(1))
+
+	got := d.AlbumStats()
+	if len(got) != 1 || got[0].Name != "Album A" {
+		t.Fatalf("AlbumStats = %+v, want one entry for Album A", got)
+	}
+	got[0].Name = "mutated"
+	if again := d.AlbumStats(); again[0].Name != "Album A" {
+		t.Fatal("mutating the returned slice affected the Downloader's own state")
+	}
+}
+
+func TestLogQuietProgressEmitsSummaryLine(t *testing.T) {
+	root := t.TempDir()
+	d := New(nil, root, 1)
+	d.progress = ui.NewProgress(3)
+	d.progress.AddSkipped()
+	d.setAlbum("Album A")
+
+	var logged string
+	d.Logf = func(format string, args ...any) { logged = fmt.Sprintf(format, args...) }
+	d.logQuietProgress()
+
+	if !strings.Contains(logged, "Album A") || !strings.Contains(logged, "skip=1") {
+		t.Fatalf("logged = %q, want it to mention the album and skip count", logged)
+	}
+}
+
+func TestLogQuietProgressNoopWithoutProgress(t *testing.T) {
+	root := t.TempDir()
+	d := New(nil, root, 1)
+	called := false
+	d.Logf = func(format string, args ...any) { called = true }
+	d.logQuietProgress()
+	if called {
+		t.Fatal("logQuietProgress should be a no-op when progress is nil")
+	}
+}
+
+func TestNewDefaultsWorkerCount(t *testing.T) {
+	d := New(nil, t.TempDir(), 0)
+	if d.NumWorkers != 20 {
+		t.Fatalf("NumWorkers = %d, want default 20", d.NumWorkers)
+	}
+	d2 := New(nil, t.TempDir(), -5)
+	if d2.NumWorkers != 20 {
+		t.Fatalf("NumWorkers = %d, want default 20 for a negative input", d2.NumWorkers)
+	}
+}
+
+func TestTruncateRunes(t *testing.T) {
+	if got := truncateRunes("short", 40); got != "short" {
+		t.Fatalf("truncateRunes short = %q, want unchanged", got)
+	}
+	got := truncateRunes("this is a rather long file name.jpg", 10)
+	if utf8.RuneCountInString(got) != 10 {
+		t.Fatalf("truncateRunes long = %q (%d runes), want 10 runes", got, utf8.RuneCountInString(got))
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("truncateRunes long = %q, want an ellipsis suffix", got)
+	}
+}
+
+func TestSavePhotosetStatusNilCacheIsNoop(t *testing.T) {
+	d := New(nil, t.TempDir(), 1) // no Cache set
+	d.savePhotosetStatus(context.Background(), cache.PhotosetStatus{})
 }

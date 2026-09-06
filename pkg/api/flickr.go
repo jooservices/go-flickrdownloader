@@ -88,6 +88,11 @@ type Client struct {
 	offline         bool
 	group           singleflight.Group
 
+	// restBaseURL is the Flickr REST endpoint; defaults to baseURL and is
+	// only ever changed via SetBaseURL, by tests that need to point a real
+	// Client at a local httptest server instead of the live API.
+	restBaseURL string
+
 	// signedGet is overridden in tests to avoid real network calls.
 	signedGet func(apiKey, apiSecret, accessToken, accessSecret, uri string, queryParams map[string]string) ([]byte, error)
 	// sleep/jitter back the 429 retry loop; overridden in tests.
@@ -103,6 +108,7 @@ func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
 		AccessSecret:    accessSecret,
 		rateLimiter:     rate.NewLimiter(rate.Every(1050*time.Millisecond), 1),
 		cacheListingTTL: 24 * time.Hour,
+		restBaseURL:     baseURL,
 		signedGet:       SignedGet,
 		sleep:           defaultRetrySleep,
 		jitter:          func() float64 { return 0.1 * rand.Float64() },
@@ -112,6 +118,12 @@ func NewClient(apiKey, apiSecret, accessToken, accessSecret string) *Client {
 // SetRateLimiter replaces the default ~1 req/sec pacing with a custom gate,
 // e.g. a persisted quota tracker enforcing Flickr's 3600/hour cap across runs.
 func (c *Client) SetRateLimiter(rl RateLimiter) { c.rateLimiter = rl }
+
+// SetBaseURL overrides the Flickr REST endpoint. Production code never calls
+// this — it exists so tests in other packages (which can't reach the
+// unexported signedGet hook this package's own tests use) can point a real
+// Client at a local httptest server instead of the live API.
+func (c *Client) SetBaseURL(url string) { c.restBaseURL = url }
 
 // SetResponseCache installs a persistent response cache. A nil cache (the
 // default) makes every request a live REST call, as before 1.3.0.
@@ -302,7 +314,7 @@ func (c *Client) apiGet(ctx context.Context, method string, params map[string]st
 func (c *Client) signedGetWithRetry(ctx context.Context, params map[string]string) ([]byte, error) {
 	attempt := 0
 	for {
-		body, err := c.signedGet(c.APIKey, c.APISecret, c.AccessToken, c.AccessSecret, baseURL, params)
+		body, err := c.signedGet(c.APIKey, c.APISecret, c.AccessToken, c.AccessSecret, c.restBaseURL, params)
 		if err != nil {
 			var hse *httpStatusError
 			if !errors.As(err, &hse) || !isRetryableHTTPStatus(hse.status) {

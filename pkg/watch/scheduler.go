@@ -18,7 +18,8 @@ type Runner func(ctx context.Context, src Source) error
 // source, sleep the poll interval (context-aware), and stop cleanly on
 // SIGINT/SIGTERM via the context.
 type Scheduler struct {
-	Path         string // watchlist file path, reloaded each cycle
+	Path         string // watchlist file path, reloaded each cycle when Load is nil
+	Load         func() (*Config, error)
 	PollInterval time.Duration
 	RunSource    Runner
 	Logf         func(format string, args ...any)
@@ -41,30 +42,35 @@ func (s *Scheduler) Loop(ctx context.Context) error {
 	}
 
 	for {
-		cfg, err := Load(s.Path)
+		cfg, err := s.load()
 		if err != nil {
 			return fmt.Errorf("load watchlist: %w", err)
 		}
-		if len(cfg.Sources) == 0 {
-			return fmt.Errorf("watchlist %s has no sources", s.Path)
+		sources := enabledSources(cfg.Sources)
+		if len(sources) == 0 {
+			label := s.Path
+			if label == "" {
+				label = "database"
+			}
+			return fmt.Errorf("watchlist %s has no sources", label)
 		}
 		if cfg.PollInterval > 0 {
 			poll = cfg.PollInterval
 		}
 		if cfg.Workers > 0 || cfg.OutputDir != "" {
-			for i := range cfg.Sources {
-				if cfg.Sources[i].Workers == 0 {
-					cfg.Sources[i].Workers = cfg.Workers
+			for i := range sources {
+				if sources[i].Workers == 0 {
+					sources[i].Workers = cfg.Workers
 				}
-				if cfg.Sources[i].OutputDir == "" {
-					cfg.Sources[i].OutputDir = cfg.OutputDir
+				if sources[i].OutputDir == "" {
+					sources[i].OutputDir = cfg.OutputDir
 				}
 			}
 		}
 
-		logf("watch: cycle start — %d source(s)", len(cfg.Sources))
+		logf("watch: cycle start — %d source(s)", len(sources))
 		cycleStart := time.Now()
-		for _, src := range cfg.Sources {
+		for _, src := range sources {
 			if ctx.Err() != nil {
 				break
 			}
@@ -88,6 +94,23 @@ func (s *Scheduler) Loop(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (s *Scheduler) load() (*Config, error) {
+	if s.Load != nil {
+		return s.Load()
+	}
+	return Load(s.Path)
+}
+
+func enabledSources(sources []Source) []Source {
+	out := make([]Source, 0, len(sources))
+	for _, src := range sources {
+		if src.Enabled {
+			out = append(out, src)
+		}
+	}
+	return out
 }
 
 // sleepCtx waits d or returns immediately when ctx is cancelled.

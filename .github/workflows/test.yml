@@ -2,7 +2,7 @@ name: test
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [master, develop]
   pull_request:
 
 jobs:
@@ -13,10 +13,18 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: "stable"
+      - name: Format check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required for:"
+            echo "$unformatted"
+            exit 1
+          fi
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test -race ./...
+        run: go test -race -cover ./...
       - name: Govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest

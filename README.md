@@ -53,7 +53,7 @@ Download the archive for your platform from the [Releases page](https://github.c
 
 ```bash
 # Example: macOS (Apple Silicon)
-tar -xzf flickrdownloader_v1.5.0_darwin_arm64.tar.gz
+tar -xzf flickrdownloader_v1.6.0_darwin_arm64.tar.gz
 sudo mv flickrdownloader /usr/local/bin/
 ```
 
@@ -63,7 +63,7 @@ Binaries are provided for macOS (amd64/arm64), Linux (amd64/arm64), and Windows 
 
 ```bash
 git clone https://github.com/jooservices/go-flickrdownloader.git
-cd flickrdownloader
+cd go-flickrdownloader
 go build -o flickrdownloader ./cmd/flickrdownloader
 ```
 
@@ -319,7 +319,7 @@ go vet ./...
 go test ./...
 
 # Build with a release version stamped in (used by --version and update)
-go build -ldflags "-X main.version=v1.5.0" -o flickrdownloader ./cmd/flickrdownloader
+go build -ldflags "-X main.version=v1.6.0" -o flickrdownloader ./cmd/flickrdownloader
 ```
 
 ## Robust downloads

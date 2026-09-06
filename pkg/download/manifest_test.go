@@ -337,3 +337,65 @@ func TestDownloadByUserRefreshDoesNotSkipListing(t *testing.T) {
 		IncludeOrphans: false,
 	})
 }
+
+func TestSaveCompletePhotosetPersistsManifest(t *testing.T) {
+	root := t.TempDir()
+	d := newTestDownloader(t, root)
+	setDir := filepath.Join(root, "owner", "Album A")
+	writePhoto(t, setDir, "11111111")
+
+	ctx := context.Background()
+	d.saveCompletePhotoset(ctx, "owner", "72157600000001", "Album A", setDir, []string{"11111111"}, 42)
+
+	status, err := d.Cache.GetPhotosetStatus(ctx, d.rootDir, "owner", "72157600000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status == nil || !status.Complete || len(status.ExpectedIDs) != 1 || status.ExpectedIDs[0] != "11111111" {
+		t.Fatalf("status = %+v, want a complete manifest with 11111111", status)
+	}
+	if status.SourceUpdatedAt != 42 {
+		t.Fatalf("SourceUpdatedAt = %d, want 42", status.SourceUpdatedAt)
+	}
+}
+
+func TestSaveCompletePhotosetNilCacheIsNoop(t *testing.T) {
+	root := t.TempDir()
+	d := New(&api.Client{}, root, 1) // no Cache set
+	// Must not panic.
+	d.saveCompletePhotoset(context.Background(), "owner", "72157600000001", "Album A", root, []string{"11111111"}, 42)
+}
+
+func TestLookupPhotosetStatusForDirFallsBackToDirectoryMatch(t *testing.T) {
+	d := New(nil, t.TempDir(), 1) // no Cache: forces the bulk-loaded fallback path
+	setDir := filepath.Join(t.TempDir(), "owner", "Album A")
+	statuses := map[string]*cache.PhotosetStatus{
+		"other-id": {Directory: setDir, ExpectedIDs: []string{"1"}},
+	}
+
+	got := d.lookupPhotosetStatusForDir(context.Background(), "owner", "missing-id", setDir, statuses, true)
+	if got == nil || len(got.ExpectedIDs) != 1 {
+		t.Fatalf("got %+v, want the entry matching setDir by directory", got)
+	}
+}
+
+func TestLookupPhotosetStatusForDirFallsBackToLocalID(t *testing.T) {
+	d := New(nil, t.TempDir(), 1)
+	setDir := filepath.Join(t.TempDir(), "owner", "Album A")
+	statuses := map[string]*cache.PhotosetStatus{
+		localPhotosetID("Album A"): {Directory: "/somewhere/else", ExpectedIDs: []string{"2"}},
+	}
+
+	got := d.lookupPhotosetStatusForDir(context.Background(), "owner", "missing-id", setDir, statuses, true)
+	if got == nil || len(got.ExpectedIDs) != 1 || got.ExpectedIDs[0] != "2" {
+		t.Fatalf("got %+v, want the localPhotosetID(basename) entry", got)
+	}
+}
+
+func TestLookupPhotosetStatusForDirNotBulkLoadedReturnsNil(t *testing.T) {
+	d := New(nil, t.TempDir(), 1)
+	got := d.lookupPhotosetStatusForDir(context.Background(), "owner", "missing-id", "/some/dir", nil, false)
+	if got != nil {
+		t.Fatalf("got %+v, want nil when not bulk-loaded and nothing cached", got)
+	}
+}

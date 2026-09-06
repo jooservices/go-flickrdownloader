@@ -1,4 +1,4 @@
-module github.com/jooservices/flickrdownloader
+module github.com/jooservices/go-flickrdownloader
 
 go 1.25.0
 

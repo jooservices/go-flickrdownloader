@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/ui"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/ui"
 )
 
 func TestWorkerHardlinkDedupe(t *testing.T) {

@@ -5,7 +5,7 @@ Thanks for helping improve flickrdownloader.
 ## Development setup
 
 ```bash
-git clone https://github.com/jooservices/flickrdownloader.git
+git clone https://github.com/jooservices/go-flickrdownloader.git
 cd flickrdownloader
 go test -race ./...
 ```

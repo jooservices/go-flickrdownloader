@@ -42,6 +42,12 @@ type Release struct {
 
 var httpClient = &http.Client{Timeout: 120 * time.Second}
 
+// renameFile indirects os.Rename so tests can force a failure at a specific
+// step of replaceExecutable's swap without needing a real filesystem failure
+// condition (permission tricks, cross-device mounts) that's hard to produce
+// portably.
+var renameFile = os.Rename
+
 // LatestRelease fetches the newest release metadata from GitHub.
 func LatestRelease(ctx context.Context) (*Release, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", Owner, Repo)
@@ -163,19 +169,45 @@ func Install(ctx context.Context, rel *Release, a *Asset) error {
 		return fmt.Errorf("resolve current binary: %w", err)
 	}
 
+	return replaceExecutable(exe, binPath)
+}
+
+// replaceExecutable swaps binPath in for the running executable at exe. The
+// new binary is staged alongside exe first (exe+".new") — so a copy failure
+// never touches the live binary — then the swap is two renames on the same
+// filesystem (exe -> exe.old, staged -> exe), each atomic. If the second
+// rename fails, it attempts to restore exe.old back to exe and reports
+// explicitly whether that recovery succeeded: silently discarding the
+// recovery rename's own error previously left Windows users (where
+// os.Rename refuses to overwrite an existing destination, so the recovery
+// rename fails whenever the aborted copy already left something at exe)
+// with no working binary and no indication recovery had failed.
+func replaceExecutable(exe, binPath string) error {
+	staged := exe + ".new"
+	os.Remove(staged)
+	if err := copyFile(binPath, staged); err != nil {
+		os.Remove(staged)
+		return fmt.Errorf("stage new binary: %w", err)
+	}
+	if err := os.Chmod(staged, 0o755); err != nil {
+		os.Remove(staged)
+		return fmt.Errorf("set permissions on staged binary: %w", err)
+	}
+
 	backup := exe + ".old"
 	os.Remove(backup)
-	if err := os.Rename(exe, backup); err != nil {
+	if err := renameFile(exe, backup); err != nil {
+		os.Remove(staged)
 		return fmt.Errorf("replace current binary: %w — hint: run from a writable location (e.g. not /usr/local/bin without sudo)", err)
 	}
 
-	if err := copyFile(binPath, exe); err != nil {
-		os.Rename(backup, exe)
-		return fmt.Errorf("install new binary: %w", err)
+	if err := renameFile(staged, exe); err != nil {
+		if restoreErr := renameFile(backup, exe); restoreErr != nil {
+			return fmt.Errorf("install new binary: %w — AND restoring the previous binary also failed: %v — the working binary is at %s, the update is at %s, restore manually", err, restoreErr, backup, staged)
+		}
+		return fmt.Errorf("install new binary: %w (previous binary restored)", err)
 	}
-	if err := os.Chmod(exe, 0o755); err != nil {
-		fmt.Printf("  warning: could not set permissions: %v\n", err)
-	}
+
 	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
 		fmt.Printf("  warning: left %s in place (%v) — Windows cannot delete a running executable; remove it after restart\n", backup, err)
 	}

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
 )
 
 func TestStoreRoundTripAndSkipDuplicates(t *testing.T) {

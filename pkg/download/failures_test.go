@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/ui"
+	"github.com/jooservices/go-flickrdownloader/pkg/ui"
 )
 
 func TestFailureLogRoundTripAndClear(t *testing.T) {

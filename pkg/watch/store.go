@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jooservices/flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
 )
 
 // LoadFromStore reads the watchlist from the account cache database.

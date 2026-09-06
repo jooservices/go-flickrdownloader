@@ -49,7 +49,7 @@ $ flickrdownloader download -u https://www.flickr.com/photos/someuser/
 
 ### Prebuilt binary (recommended)
 
-Download the archive for your platform from the [Releases page](https://github.com/jooservices/flickrdownloader/releases/latest), extract it, and put the `flickrdownloader` binary somewhere on your `PATH`.
+Download the archive for your platform from the [Releases page](https://github.com/jooservices/go-flickrdownloader/releases/latest), extract it, and put the `flickrdownloader` binary somewhere on your `PATH`.
 
 ```bash
 # Example: macOS (Apple Silicon)
@@ -62,7 +62,7 @@ Binaries are provided for macOS (amd64/arm64), Linux (amd64/arm64), and Windows 
 ### Build from source
 
 ```bash
-git clone https://github.com/jooservices/flickrdownloader.git
+git clone https://github.com/jooservices/go-flickrdownloader.git
 cd flickrdownloader
 go build -o flickrdownloader ./cmd/flickrdownloader
 ```
@@ -70,7 +70,7 @@ go build -o flickrdownloader ./cmd/flickrdownloader
 Or install directly with Go:
 
 ```bash
-go install github.com/jooservices/flickrdownloader/cmd/flickrdownloader@latest
+go install github.com/jooservices/go-flickrdownloader/cmd/flickrdownloader@latest
 ```
 
 ## Quick start

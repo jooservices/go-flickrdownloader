@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jooservices/flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
 )
 
 // ImportLegacyFiles copies watchlist.yaml / sources.txt into the cache

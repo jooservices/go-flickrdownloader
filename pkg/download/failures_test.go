@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jooservices/go-flickrdownloader/pkg/ui"
 )
@@ -33,6 +34,48 @@ func TestFailureLogRoundTripAndClear(t *testing.T) {
 	}
 	if _, err := os.Stat(d.failuresPath()); !os.IsNotExist(err) {
 		t.Fatal("empty log file should be removed")
+	}
+}
+
+// TestRecordPhotoSuccessDoesNotRewriteUnrelatedFailures is a regression test
+// for clearFailure unconditionally calling saveFailures (mkdir + temp file +
+// write + rename) even when nothing was actually removed — which
+// recordPhotoSuccess triggers on every successful download, not just ones
+// that clear a real pending failure. Under the default 20 concurrent
+// workers, this serialized every successful download on failMu for a
+// wasteful rewrite whenever any failure record existed anywhere under the
+// output root.
+func TestRecordPhotoSuccessDoesNotRewriteUnrelatedFailures(t *testing.T) {
+	root := t.TempDir()
+	d := New(nil, root, 1)
+	album := filepath.Join(root, "nsid", "Album")
+	if err := os.MkdirAll(album, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d.OutDir = album
+	d.persistFailure("11111111", "https://live.staticflickr.com/a.jpg", "timeout")
+
+	path := d.failuresPath()
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// Clearing a photo that was never a pending failure must not touch the
+	// file at all.
+	d.recordPhotoSuccess("99999999")
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("failures file should still exist: %v", err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Fatalf("failures file was rewritten (mtime = %v, want unchanged %v) even though nothing matched", info.ModTime(), old)
+	}
+
+	recs := d.loadFailures()
+	if len(recs) != 1 || recs[0].ID != "11111111" {
+		t.Fatalf("failures = %+v, want the original unrelated record preserved", recs)
 	}
 }
 

@@ -23,7 +23,7 @@ func ImportLegacyFiles(ctx context.Context, store *cache.Store) error {
 		return nil
 	}
 
-	cfg, found, err := loadFirstLegacyWatchlist()
+	cfg, found, err := loadAllLegacyWatchlists()
 	if err != nil {
 		return err
 	}
@@ -38,8 +38,20 @@ func ImportLegacyFiles(ctx context.Context, store *cache.Store) error {
 	return store.SetWatchlistLegacyImported(ctx)
 }
 
-func loadFirstLegacyWatchlist() (*Config, []string, error) {
-	var loaded *Config
+// loadAllLegacyWatchlists loads every legacy watchlist file that exists, not
+// just the first: every found file's Sources are merged into one Config,
+// while whichever file is found first (DefaultPaths' order — watchlist.yaml
+// before sources.txt) supplies the scalar globals (poll interval, output
+// dir, workers). Duplicate URLs across files are harmless: InsertWatchlist
+// no-ops on a conflicting source_url (UNIQUE constraint).
+//
+// A previous version loaded only the first found file, yet still renamed
+// every found file to .migrated and marked the one-shot import done
+// regardless — silently and permanently discarding every URL in a second
+// legacy file whenever both watchlist.yaml and sources.txt existed, with no
+// error, warning, or way to re-trigger the import.
+func loadAllLegacyWatchlists() (*Config, []string, error) {
+	var merged *Config
 	var found []string
 	for _, path := range DefaultPaths() {
 		if _, err := os.Stat(path); err != nil {
@@ -49,16 +61,16 @@ func loadFirstLegacyWatchlist() (*Config, []string, error) {
 			return nil, nil, fmt.Errorf("stat legacy watchlist %s: %w", path, err)
 		}
 		found = append(found, path)
-		if loaded != nil {
-			continue
-		}
 		cfg, err := Load(path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("import legacy watchlist %s: %w", path, err)
 		}
-		loaded = cfg
+		if merged == nil {
+			merged = &Config{PollInterval: cfg.PollInterval, OutputDir: cfg.OutputDir, Workers: cfg.Workers}
+		}
+		merged.Sources = append(merged.Sources, cfg.Sources...)
 	}
-	return loaded, found, nil
+	return merged, found, nil
 }
 
 func persistLegacyWatchlist(ctx context.Context, store *cache.Store, cfg *Config) error {

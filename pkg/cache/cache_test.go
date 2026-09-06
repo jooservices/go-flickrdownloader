@@ -964,10 +964,11 @@ func TestDetectSchemaVersion(t *testing.T) {
 		`ALTER TABLE photoset_status ADD COLUMN source_updated_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE photoset_status ADD COLUMN file_sizes TEXT NOT NULL DEFAULT '{}'`,
 		`CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE watchlist (id INTEGER PRIMARY KEY AUTOINCREMENT, source_url TEXT NOT NULL UNIQUE, albums TEXT NOT NULL DEFAULT 'all', include_orphans INTEGER NOT NULL DEFAULT 1, poll_interval_ns INTEGER NOT NULL DEFAULT 0, output_dir TEXT NOT NULL DEFAULT '', workers INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 	}
 	// wantAfterStep[i] is detectSchemaVersion's result after applying
 	// steps[:i] — i.e. wantAfterStep[0] is the fresh-database case.
-	wantAfterStep := []int{0, 1, 1, 2, 3, 4, 5, 6, currentSchemaVersion}
+	wantAfterStep := []int{0, 1, 1, 2, 3, 4, 5, 6, 7, currentSchemaVersion}
 
 	for i, want := range wantAfterStep {
 		t.Run(fmt.Sprintf("after_%d_steps", i), func(t *testing.T) {

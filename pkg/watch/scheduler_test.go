@@ -131,6 +131,58 @@ func TestSchedulerFailsOnMissingWatchlist(t *testing.T) {
 // during the inter-cycle sleep is immediate, not a wait for the full
 // poll_interval — critical for a process meant to be stopped by
 // SIGINT/SIGTERM at any point in its cycle.
+func TestSchedulerLoadHookAndSkipsDisabled(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Scheduler{
+		Logf: func(string, ...any) {},
+		Load: func() (*Config, error) {
+			return &Config{Sources: []Source{
+				{URL: "https://www.flickr.com/photos/alice/", Enabled: true},
+				{URL: "https://www.flickr.com/photos/disabled/", Enabled: false},
+				{URL: "https://www.flickr.com/photos/bob/", Enabled: true},
+			}}, nil
+		},
+		RunSource: func(_ context.Context, src Source) error {
+			mu.Lock()
+			seen = append(seen, src.URL)
+			n := len(seen)
+			mu.Unlock()
+			if n >= 2 {
+				cancel()
+			}
+			return nil
+		},
+	}
+	if err := s.Loop(ctx); err != nil {
+		t.Fatalf("Loop: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) < 2 {
+		t.Fatalf("ran %v, want alice and bob", seen)
+	}
+	for _, u := range seen {
+		if u == "https://www.flickr.com/photos/disabled/" {
+			t.Fatalf("disabled source ran: %v", seen)
+		}
+	}
+}
+
+func TestSchedulerFailsWhenAllSourcesDisabled(t *testing.T) {
+	s := &Scheduler{
+		Load: func() (*Config, error) {
+			return &Config{Sources: []Source{{URL: "https://www.flickr.com/photos/alice/", Enabled: false}}}, nil
+		},
+		RunSource: func(context.Context, Source) error { return nil },
+	}
+	if err := s.Loop(context.Background()); err == nil {
+		t.Fatal("expected an error when every source is disabled")
+	}
+}
+
 func TestSchedulerStopsPromptlyOnContextCancelDuringSleep(t *testing.T) {
 	path := writeWatchlist(t, `
 poll_interval: 1h

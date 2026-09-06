@@ -1,5 +1,8 @@
 # systemd user service for `flickrdownloader watch`.
 #
+# Requires `flickrdownloader auth` and at least one `watch add` (or a
+# watchlist.yaml / sources.txt that will be imported once on first run).
+#
 # Install:
 #   mkdir -p ~/.config/systemd/user
 #   cp flickrdownloader-watch.service ~/.config/systemd/user/

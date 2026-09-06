@@ -96,27 +96,6 @@ func TestBuildPickerItems(t *testing.T) {
 	}
 }
 
-func TestResolveWatchlistPath(t *testing.T) {
-	origWatchFile := watchFile
-	defer func() { watchFile = origWatchFile }()
-
-	watchFile = "/explicit/path.yaml"
-	got, err := resolveWatchlistPath(false)
-	if err != nil || got != "/explicit/path.yaml" {
-		t.Fatalf("resolveWatchlistPath with --file = %q err=%v, want the explicit path", got, err)
-	}
-
-	watchFile = ""
-	t.Setenv("HOME", t.TempDir())
-	if _, err := resolveWatchlistPath(false); err == nil {
-		t.Fatal("expected an error when no watchlist exists and allowMissing is false")
-	}
-	got, err = resolveWatchlistPath(true)
-	if err != nil || got == "" {
-		t.Fatalf("resolveWatchlistPath(allowMissing=true) = %q err=%v, want a default path", got, err)
-	}
-}
-
 func TestPrintQuotaHeaderSkippedWithoutLimiter(t *testing.T) {
 	client := api.NewClient("key", "secret", "token", "token-secret")
 	out := captureStdout(t, func() { printQuotaHeader(client) })

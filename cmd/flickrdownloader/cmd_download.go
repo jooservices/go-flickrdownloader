@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/config"
-	"github.com/jooservices/flickrdownloader/pkg/download"
-	"github.com/jooservices/flickrdownloader/pkg/ui"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/config"
+	"github.com/jooservices/go-flickrdownloader/pkg/download"
+	"github.com/jooservices/go-flickrdownloader/pkg/ui"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )

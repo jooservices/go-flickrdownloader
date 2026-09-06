@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jooservices/flickrdownloader/pkg/config"
+	"github.com/jooservices/go-flickrdownloader/pkg/config"
 	"gopkg.in/yaml.v3"
 )
 

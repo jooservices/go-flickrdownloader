@@ -35,4 +35,4 @@ checksum:
 release:
   github:
     owner: jooservices
-    name: flickrdownloader
+    name: go-flickrdownloader

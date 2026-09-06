@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/ui"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/ui"
 )
 
 // FailuresFileName is the JSONL log of photo download failures, stored in

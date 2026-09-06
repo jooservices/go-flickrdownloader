@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 func testSets() []api.PhotoSetInfo {

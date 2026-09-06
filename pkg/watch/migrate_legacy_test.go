@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
 )
 
 func TestImportLegacyFilesCopiesYAMLAndRenames(t *testing.T) {

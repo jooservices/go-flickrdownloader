@@ -48,6 +48,10 @@ var httpClient = &http.Client{Timeout: 120 * time.Second}
 // portably.
 var renameFile = os.Rename
 
+// chmodFile indirects os.Chmod so tests can force the staged-binary chmod
+// in replaceExecutable to fail and verify that failure is non-fatal.
+var chmodFile = os.Chmod
+
 // LatestRelease fetches the newest release metadata from GitHub.
 func LatestRelease(ctx context.Context) (*Release, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", Owner, Repo)
@@ -194,20 +198,37 @@ func replaceExecutable(exe, binPath string) error {
 		os.Remove(staged)
 		return fmt.Errorf("stage new binary: %w", err)
 	}
-	if err := os.Chmod(staged, 0o755); err != nil {
-		os.Remove(staged)
-		return fmt.Errorf("set permissions on staged binary: %w", err)
+	// Cleanup is deferred so every remaining early return removes the
+	// staged copy for free (a no-op once it's actually been renamed to exe)
+	// — except the one case where both the install rename and the recovery
+	// rename fail, where staged is the only intact copy of the new binary
+	// left and must be preserved for manual recovery, not silently deleted.
+	keepStaged := false
+	defer func() {
+		if !keepStaged {
+			os.Remove(staged)
+		}
+	}()
+
+	// copyFile already created staged at mode 0755; re-assert it
+	// defensively, but a failure here is not fatal — some filesystems
+	// (certain FUSE/overlay mounts, sandboxed environments) reject chmod
+	// even though the file was already created with the right mode, and
+	// the pre-atomic-swap version of this code only warned on this same
+	// failure rather than aborting the whole update.
+	if err := chmodFile(staged, 0o755); err != nil {
+		fmt.Printf("  warning: could not set permissions on staged binary: %v\n", err)
 	}
 
 	backup := exe + ".old"
 	os.Remove(backup)
 	if err := renameFile(exe, backup); err != nil {
-		os.Remove(staged)
 		return fmt.Errorf("replace current binary: %w — hint: run from a writable location (e.g. not /usr/local/bin without sudo)", err)
 	}
 
 	if err := renameFile(staged, exe); err != nil {
 		if restoreErr := renameFile(backup, exe); restoreErr != nil {
+			keepStaged = true
 			return fmt.Errorf("install new binary: %w — AND restoring the previous binary also failed: %v — the working binary is at %s, the update is at %s, restore manually", err, restoreErr, backup, staged)
 		}
 		return fmt.Errorf("install new binary: %w (previous binary restored)", err)

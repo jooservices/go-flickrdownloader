@@ -392,6 +392,12 @@ func TestReplaceExecutableSwapFailsThenRecovers(t *testing.T) {
 	if readErr != nil || string(got) != "old binary" {
 		t.Fatalf("exe should be restored to the old binary, got %q (err %v)", got, readErr)
 	}
+	// Regression test: the staged exe+".new" copy was previously left
+	// orphaned on disk indefinitely whenever recovery succeeded, since
+	// nothing removed it on that specific path.
+	if _, err := os.Stat(exe + ".new"); !os.IsNotExist(err) {
+		t.Fatalf("staged file %s.new should have been removed after a successful recovery, stat err = %v", exe, err)
+	}
 }
 
 // TestReplaceExecutableSwapAndRecoveryBothFail is a regression test for the
@@ -431,6 +437,45 @@ func TestReplaceExecutableSwapAndRecoveryBothFail(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), exe+".old") || !strings.Contains(err.Error(), exe+".new") {
 		t.Fatalf("error = %v, want it to name both file locations for manual recovery", err)
+	}
+	// The staged copy must survive this specific failure — it's the only
+	// intact copy of the new binary left, and the error message points the
+	// user at it by path.
+	if _, err := os.Stat(exe + ".new"); err != nil {
+		t.Fatalf("staged file %s.new should have been preserved for manual recovery: %v", exe, err)
+	}
+}
+
+// TestReplaceExecutableChmodFailureIsNonFatal is a regression test: chmod
+// failing on the staged binary previously aborted the whole update, even
+// though copyFile already created the file at the target mode (0755) — some
+// filesystems (FUSE/overlay mounts, sandboxed environments) reject chmod
+// itself even when the file's actual mode is already correct. The
+// pre-atomic-swap version of this code only warned on this same failure;
+// this restores that tolerance.
+func TestReplaceExecutableChmodFailureIsNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "flickrdownloader")
+	if err := os.WriteFile(exe, []byte("old binary"), 0o755); err != nil {
+		t.Fatalf("seed exe: %v", err)
+	}
+	newBin := filepath.Join(dir, "new-binary")
+	if err := os.WriteFile(newBin, []byte("new binary"), 0o644); err != nil {
+		t.Fatalf("seed new binary: %v", err)
+	}
+
+	origChmod := chmodFile
+	defer func() { chmodFile = origChmod }()
+	chmodFile = func(name string, mode os.FileMode) error {
+		return fmt.Errorf("simulated chmod failure")
+	}
+
+	if err := replaceExecutable(exe, newBin); err != nil {
+		t.Fatalf("replaceExecutable: %v, want the chmod failure to be non-fatal", err)
+	}
+	got, err := os.ReadFile(exe)
+	if err != nil || string(got) != "new binary" {
+		t.Fatalf("exe should still be replaced despite the chmod failure, got %q (err %v)", got, err)
 	}
 }
 

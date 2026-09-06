@@ -325,9 +325,19 @@ func flushQuotaOnExit(tr *quota.Tracker) func() {
 // tracker and, when available, the account-scoped response cache (ADR-019).
 // The cache is an optimization only: if it can't be opened (e.g. read-only
 // filesystem), the run continues without one rather than failing.
+// testAPIBaseURL, when set, overrides the Flickr REST endpoint every client
+// this process builds talks to. Production never sets it; it exists so
+// cmd's own tests can drive a run* command end-to-end against a local
+// httptest server instead of the live API, the same way api.Client.SetBaseURL
+// lets pkg/api's and pkg/download's tests do.
+var testAPIBaseURL string
+
 func newClientWithCache(cfg *config.Config, tr *quota.Tracker, refresh, offline bool) (*api.Client, *cache.Store, error) {
 	client := api.NewClient(cfg.APIKey, cfg.APISecret, cfg.OAuthToken, cfg.OAuthSecret)
 	client.SetRateLimiter(tr)
+	if testAPIBaseURL != "" {
+		client.SetBaseURL(testAPIBaseURL)
+	}
 
 	cachePath, err := config.CachePath(cfg.APIKey, cfg.NSID)
 	if err != nil {

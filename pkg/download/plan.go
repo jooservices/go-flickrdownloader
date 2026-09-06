@@ -1,6 +1,6 @@
 package download
 
-import "github.com/jooservices/flickrdownloader/pkg/api"
+import "github.com/jooservices/go-flickrdownloader/pkg/api"
 
 // Size estimation constants. Flickr original JPEGs typically compress to
 // roughly 0.25–0.5 bytes per pixel; videos are much denser per frame pixel.

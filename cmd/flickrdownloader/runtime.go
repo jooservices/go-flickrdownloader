@@ -12,12 +12,12 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/cache"
-	"github.com/jooservices/flickrdownloader/pkg/config"
-	"github.com/jooservices/flickrdownloader/pkg/download"
-	"github.com/jooservices/flickrdownloader/pkg/quota"
-	"github.com/jooservices/flickrdownloader/pkg/ui"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/config"
+	"github.com/jooservices/go-flickrdownloader/pkg/download"
+	"github.com/jooservices/go-flickrdownloader/pkg/quota"
+	"github.com/jooservices/go-flickrdownloader/pkg/ui"
 	"golang.org/x/term"
 )
 

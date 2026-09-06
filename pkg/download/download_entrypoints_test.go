@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 // TestCanonicalPath covers the symlink-resolution helper backing the

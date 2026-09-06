@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 )
 
 func TestStoreRoundTripAndDelete(t *testing.T) {

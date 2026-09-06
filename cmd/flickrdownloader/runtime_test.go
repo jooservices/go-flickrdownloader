@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/config"
+	"github.com/jooservices/go-flickrdownloader/pkg/config"
 )
 
 // TestRejectRefreshOffline covers the guard that stops the contradictory

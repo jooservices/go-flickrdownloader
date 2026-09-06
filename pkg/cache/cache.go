@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
 	_ "modernc.org/sqlite"
 )
 

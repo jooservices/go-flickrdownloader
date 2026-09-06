@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/download"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/download"
 )
 
 // captureStdout redirects os.Stdout for the duration of fn and returns

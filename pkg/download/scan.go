@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/jooservices/flickrdownloader/pkg/api"
-	"github.com/jooservices/flickrdownloader/pkg/cache"
+	"github.com/jooservices/go-flickrdownloader/pkg/api"
+	"github.com/jooservices/go-flickrdownloader/pkg/cache"
 )
 
 // ScanResult describes one album (or the uncategorized bucket) after a disk scan.

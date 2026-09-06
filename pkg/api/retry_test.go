@@ -45,7 +45,15 @@ func TestAPIParseRetryAfter(t *testing.T) {
 		{"seconds", "5", 5 * time.Second, true},
 		{"zero seconds", "0", 0, true},
 		{"negative rejected", "-1", 0, false},
+		{"leading plus rejected", "+30", 0, false},
 		{"over cap clamps", "3600", maxHTTPRetryAfter, true},
+		// Regression test: seconds this large overflows int64 when naively
+		// converted to a time.Duration (multiplying by 1e9) before the cap
+		// check runs, wrapping negative — time.NewTimer(negative) fires
+		// immediately, turning an already-throttled endpoint into a
+		// zero-delay hot retry loop instead of respecting the 60s cap.
+		{"huge value overflow clamps instead of going negative", "18446744070", maxHTTPRetryAfter, true},
+		{"max int64 clamps instead of overflowing", "9223372036854775807", maxHTTPRetryAfter, true},
 		{"garbage rejected", "not-a-number", 0, false},
 		{"http date in future", now.Add(10 * time.Second).Format(http.TimeFormat), 10 * time.Second, true},
 		{"http date in past rejected", now.Add(-10 * time.Second).Format(http.TimeFormat), 0, false},

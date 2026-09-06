@@ -102,18 +102,27 @@ const maxHTTPRetryAfter = 60 * time.Second
 // HTTP-date — capped at maxHTTPRetryAfter. Duplicated from pkg/download's
 // copy rather than shared: pkg/api sits below pkg/download in the module's
 // layering (cmd -> pkg/{api,config,download,...}), so api must not import
-// download.
+// download. Ported verbatim (including parseNonNegativeInt64's digit-only
+// parsing and the cap check ordering) after the two copies were found to
+// have diverged: this file used to convert seconds to a time.Duration
+// (multiplying by 1e9) before comparing against the cap, so a delta-seconds
+// value near or above ~9.2e9 overflowed int64 and could wrap negative —
+// time.NewTimer(negative) fires immediately, turning an already-throttled
+// endpoint into a zero-delay hot retry loop. Comparing the raw seconds
+// count against the cap before multiplying, as below, cannot overflow. The
+// old strconv.ParseInt call also accepted a leading '+' that pkg/download's
+// digit-only parseNonNegativeInt64 rejects; parseNonNegativeInt64 here
+// closes that divergence too.
 func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return 0, false
 	}
-	if seconds, err := strconv.ParseInt(v, 10, 64); err == nil && seconds >= 0 {
-		d := time.Duration(seconds) * time.Second
-		if d > maxHTTPRetryAfter {
+	if seconds, ok := parseNonNegativeInt64(v); ok {
+		if seconds > int64(maxHTTPRetryAfter/time.Second) {
 			return maxHTTPRetryAfter, true
 		}
-		return d, true
+		return time.Duration(seconds) * time.Second, true
 	}
 	when, err := http.ParseTime(v)
 	if err != nil {
@@ -127,6 +136,22 @@ func parseRetryAfter(v string, now time.Time) (time.Duration, bool) {
 		return maxHTTPRetryAfter, true
 	}
 	return delay, true
+}
+
+// parseNonNegativeInt64 parses v as a base-10 non-negative integer,
+// rejecting anything but digits (notably a leading '+' or '-', which
+// strconv.ParseInt alone would accept).
+func parseNonNegativeInt64(v string) (int64, bool) {
+	if v == "" {
+		return 0, false
+	}
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	return n, err == nil
 }
 
 // defaultRetrySleep is the production retrySleep: a context-aware timer.

@@ -64,17 +64,6 @@ func rateLimitBackoff(attempt int, jitter float64) time.Duration {
 	return d + time.Duration(float64(d)*jitter)
 }
 
-// rateLimitedError marks a response that exhausted the retry loop without a
-// resolution (normally only via context cancellation).
-type rateLimitedError struct {
-	code    int
-	message string
-}
-
-func (e *rateLimitedError) Error() string {
-	return fmt.Sprintf("flickr rate limit [%d]: %s", e.code, e.message)
-}
-
 // httpStatusError marks a Flickr REST response whose HTTP status itself (as
 // opposed to the JSON body isRateLimitResponse inspects) signals the
 // outcome: a transport-level 429/5xx from Flickr's edge, or an ordinary

@@ -121,3 +121,83 @@ func TestSignedGetSetsUserAgent(t *testing.T) {
 		t.Fatalf("User-Agent = %q, want %q", gotUA, userAgent)
 	}
 }
+
+// TestGetRequestToken covers the OAuth1.0a request-token step: a
+// successful, URL-encoded response is parsed into (token, secret).
+func TestGetRequestToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("oauth_token=req-token&oauth_token_secret=req-secret&oauth_callback_confirmed=true"))
+	}))
+	defer srv.Close()
+
+	orig := requestTokenURL
+	defer func() { requestTokenURL = orig }()
+	requestTokenURL = srv.URL
+
+	token, secret, err := GetRequestToken("key", "secret")
+	if err != nil {
+		t.Fatalf("GetRequestToken: %v", err)
+	}
+	if token != "req-token" || secret != "req-secret" {
+		t.Fatalf("token=%q secret=%q, want req-token/req-secret", token, secret)
+	}
+}
+
+// TestGetAccessToken covers the OAuth1.0a access-token step.
+func TestGetAccessToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("oauth_token=acc-token&oauth_token_secret=acc-secret&user_nsid=123456789%40N01&username=alice"))
+	}))
+	defer srv.Close()
+
+	orig := accessTokenURL
+	defer func() { accessTokenURL = orig }()
+	accessTokenURL = srv.URL
+
+	token, secret, nsid, username, err := GetAccessToken("key", "secret", "req-token", "req-secret", "verifier")
+	if err != nil {
+		t.Fatalf("GetAccessToken: %v", err)
+	}
+	if token != "acc-token" || secret != "acc-secret" || nsid != "123456789@N01" || username != "alice" {
+		t.Fatalf("got token=%q secret=%q nsid=%q username=%q", token, secret, nsid, username)
+	}
+}
+
+func TestGetAuthorizeURL(t *testing.T) {
+	got := GetAuthorizeURL("a token")
+	want := authorizeURL + "?oauth_token=a+token&perms=read"
+	if got != want {
+		t.Fatalf("GetAuthorizeURL = %q, want %q", got, want)
+	}
+}
+
+// TestOAuthGetNon200 covers OAuthGet's own status check, independent of
+// SignedGet's (a genuinely different code path, both hit for real during
+// `auth`).
+func TestOAuthGetNon200(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden"))
+	}))
+	defer srv.Close()
+
+	if _, err := OAuthGet("key", "secret", "", srv.URL, nil); err == nil {
+		t.Fatal("expected an error for a non-200 OAuth response")
+	}
+}
+
+// TestOAuthGetProblem covers Flickr's oauth_problem convention: a 200
+// response whose body still signals failure via a query-encoded field.
+func TestOAuthGetProblem(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("oauth_problem=permission_denied"))
+	}))
+	defer srv.Close()
+
+	if _, err := OAuthGet("key", "secret", "", srv.URL, nil); err == nil {
+		t.Fatal("expected an error for an oauth_problem response")
+	}
+}

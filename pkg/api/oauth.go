@@ -16,14 +16,21 @@ import (
 )
 
 const (
-	requestTokenURL      = "https://www.flickr.com/services/oauth/request_token"
 	authorizeURL         = "https://www.flickr.com/services/oauth/authorize"
-	accessTokenURL       = "https://www.flickr.com/services/oauth/access_token"
 	oauthSignatureMethod = "HMAC-SHA1"
 	oauthVersion         = "1.0"
 	// userAgent identifies this client to Flickr; some edges/WAFs throttle
 	// the default Go-http-client/1.1 UA more aggressively than a named one.
 	userAgent = "flickrdownloader"
+)
+
+// requestTokenURL/accessTokenURL are vars (not const), like restBaseURL,
+// solely so tests can point GetRequestToken/GetAccessToken at a local
+// httptest server instead of the live API. Production code never changes
+// them.
+var (
+	requestTokenURL = "https://www.flickr.com/services/oauth/request_token"
+	accessTokenURL  = "https://www.flickr.com/services/oauth/access_token"
 )
 
 func hmacSHA1(key, data string) string {

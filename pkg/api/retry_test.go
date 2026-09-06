@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -120,5 +121,23 @@ func TestIsRateLimitResponse(t *testing.T) {
 				t.Fatalf("isRateLimitResponse(%q) = %v, want %v", c.body, got, c.want)
 			}
 		})
+	}
+}
+
+func TestDefaultRetrySleepCompletesNormally(t *testing.T) {
+	start := time.Now()
+	if err := defaultRetrySleep(context.Background(), 10*time.Millisecond); err != nil {
+		t.Fatalf("defaultRetrySleep: %v", err)
+	}
+	if time.Since(start) < 10*time.Millisecond {
+		t.Fatal("defaultRetrySleep returned before the requested duration elapsed")
+	}
+}
+
+func TestDefaultRetrySleepStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := defaultRetrySleep(ctx, time.Hour); err == nil {
+		t.Fatal("expected an error when the context is already cancelled")
 	}
 }

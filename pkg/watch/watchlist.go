@@ -193,8 +193,6 @@ func validFlickrURL(urlStr string) bool {
 	switch parts[0] {
 	case "photos", "people":
 		return len(parts) >= 2
-	case "photo.gne":
-		return len(parts) >= 2
 	default:
 		return false
 	}

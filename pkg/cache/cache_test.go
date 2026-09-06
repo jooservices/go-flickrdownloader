@@ -282,6 +282,64 @@ func TestPhotoMetadataRoundTripAndLease(t *testing.T) {
 	}
 }
 
+// TestRenewResponseLease covers ADR-022's cross-process cache-miss
+// coordination guarantee (dead owner's lease expires within its TTL): only
+// the current owner can extend an active lease, a wrong owner is refused,
+// and an already-expired lease can no longer be renewed by anyone —
+// matching TryResponseLease's own "an expired lease can be claimed" rule,
+// so a stale lease doesn't linger past its TTL just because something still
+// calls Renew on it.
+func TestRenewResponseLease(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "responses.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if ok, err := store.TryResponseLease(ctx, "key", "owner-1", time.Minute); err != nil || !ok {
+		t.Fatalf("initial lease = %v err=%v, want acquired", ok, err)
+	}
+
+	// Wrong owner cannot renew.
+	if ok, err := store.RenewResponseLease(ctx, "key", "owner-2", time.Minute); err != nil || ok {
+		t.Fatalf("renew by wrong owner = %v err=%v, want refused", ok, err)
+	}
+
+	// Correct owner extends it.
+	if ok, err := store.RenewResponseLease(ctx, "key", "owner-1", time.Hour); err != nil || !ok {
+		t.Fatalf("renew by owner = %v err=%v, want extended", ok, err)
+	}
+	// A competing owner must still be blocked — proves the renewal actually
+	// pushed expires_at forward rather than being a no-op success.
+	if ok, err := store.TryResponseLease(ctx, "key", "owner-2", time.Minute); err != nil || ok {
+		t.Fatalf("lease after renewal = %v err=%v, want still held by owner-1", ok, err)
+	}
+
+	// No lease at all for this key.
+	if ok, err := store.RenewResponseLease(ctx, "missing-key", "owner-1", time.Minute); err != nil || ok {
+		t.Fatalf("renew with no lease = %v err=%v, want refused", ok, err)
+	}
+
+	// An already-expired lease cannot be renewed by its former owner —
+	// TryResponseLease already lets a new owner claim it once expired
+	// (TestPhotoMetadataRoundTripAndLease/TestClearRemovesResponsesAndStatuses
+	// cover that side); Renew must not let the old owner resurrect it
+	// instead.
+	if _, err := store.db.ExecContext(ctx,
+		"UPDATE response_leases SET expires_at = ? WHERE cache_key = ?",
+		time.Now().Add(-time.Minute).Unix(), "key"); err != nil {
+		t.Fatalf("force-expire lease: %v", err)
+	}
+	if ok, err := store.RenewResponseLease(ctx, "key", "owner-1", time.Minute); err != nil || ok {
+		t.Fatalf("renew of expired lease = %v err=%v, want refused", ok, err)
+	}
+
+	if ok, err := store.RenewResponseLease(ctx, "key", "owner-1", 0); err == nil || ok {
+		t.Fatalf("renew with non-positive ttl = %v err=%v, want an error", ok, err)
+	}
+}
+
 func TestBindAuthClearsPrivateDataKeepsManifests(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "responses.db"))
 	if err != nil {

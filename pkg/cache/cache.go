@@ -94,6 +94,23 @@ func Open(path string) (*Store, error) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, fmt.Errorf("create cache directory: %w", err)
 		}
+		// Create the database file at 0600 before sql.Open, rather than
+		// relying solely on protectCacheFiles at the end of this function.
+		// Without this, SQLite creates the file under the process umask
+		// (commonly 0644) and it stays world/group-readable for the
+		// duration of the pragma setup and first-run migration below —
+		// a real, if narrow, window since cached rows hold Flickr listing
+		// data (not credentials — cacheKey already excludes oauth_*
+		// params, but still not meant to be world-readable). O_CREATE's
+		// mode is applied atomically, so this leaves no window at all; it
+		// only opens (never truncates) a file that already exists.
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create cache database file: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("create cache database file: %w", err)
+		}
 	}
 
 	db, err := sql.Open("sqlite", path)

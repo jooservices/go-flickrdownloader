@@ -6,7 +6,7 @@ Thanks for helping improve flickrdownloader.
 
 ```bash
 git clone https://github.com/jooservices/go-flickrdownloader.git
-cd flickrdownloader
+cd go-flickrdownloader
 go test -race ./...
 ```
 

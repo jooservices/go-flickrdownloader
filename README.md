@@ -1,4 +1,9 @@
-# Flickr Downloader
+# jooservices/go-flickrdownloader
+
+[![CI](https://github.com/jooservices/go-flickrdownloader/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/jooservices/go-flickrdownloader/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-blue.svg)](https://go.dev/)
+[![GitHub Release](https://img.shields.io/github/v/release/jooservices/go-flickrdownloader?display_name=tag)](https://github.com/jooservices/go-flickrdownloader/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A fast, concurrent command-line tool to download all photos and videos from a Flickr user, album, or single photo — organized automatically into per-album folders on disk.
 
